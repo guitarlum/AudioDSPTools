@@ -97,7 +97,15 @@ DSP_SAMPLE** Delay::Process(DSP_SAMPLE** inputs, const size_t numChannels, const
       }
 
       // Output mix
-      mOutputs[c][s] = static_cast<DSP_SAMPLE>(inputSample * (1.0 - mMix) + delayedSample * mMix);
+      double finalSample = inputSample * (1.0 - mMix) + delayedSample * mMix;
+
+      // NaN / Infinity protection
+      if (std::isnan(finalSample) || std::isinf(finalSample)) {
+          finalSample = 0.0;
+          Reset();
+      }
+
+      mOutputs[c][s] = static_cast<DSP_SAMPLE>(finalSample);
       
       // Write to buffer with feedback
       mBuffer[c][mWriteIndex] = inputSample + delayedSample * mFeedback;

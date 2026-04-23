@@ -88,31 +88,52 @@ DSP_SAMPLE** Reverb::Process(DSP_SAMPLE** inputs, const size_t numChannels, cons
     mLfoPhase += 0.5 * 2.0 * kPI / mSampleRate; // 0.5 Hz LFO
     if (mLfoPhase > 2.0 * kPI) mLfoPhase -= 2.0 * kPI;
 
+    // Downmix stereo input to mono for the FDN
+    double inputSample = 0.0;
+    for (size_t c = 0; c < numChannels; c++) {
+      inputSample += inputs[c][s];
+    }
+    if (numChannels > 0) inputSample /= static_cast<double>(numChannels);
+
+    // --- FDN Processing (Strictly ONCE per frame) ---
+    double readVals[8] = {0};
+
+    for (int i = 0; i < kNumLines; i++)
+    {
+      // Simple LFO modulation on the read length
+      double mod = std::sin(mLfoPhase + (i * kPI / 4.0)) * 5.0; // 5 samples depth
+      double readPos = static_cast<double>(mDelayIndices[i]) - static_cast<double>(mDelayLengths[i]) - mod;
+      while (readPos < 0.0) readPos += mDelayLines[i].size();
+
+      size_t idx1 = static_cast<size_t>(readPos);
+      size_t idx2 = (idx1 + 1) % mDelayLines[i].size();
+      double frac = readPos - idx1;
+
+      double val = mDelayLines[i][idx1] * (1.0 - frac) + mDelayLines[i][idx2] * frac;
+
+      // Apply 1-pole lowpass
+      mDelayLowpass[i] = mDelayLowpass[i] * (1.0 - lpfCoef) + val * lpfCoef;
+      readVals[i] = mDelayLowpass[i] * loopGain;
+    }
+
+    // Mix matrix feedback
+    for (int i = 0; i < kNumLines; i++)
+    {
+      double feedback = 0.0;
+      for (int j = 0; j < kNumLines; j++) {
+          feedback += mixMatrix[i][j] * readVals[j];
+      }
+      
+      mDelayLines[i][mDelayIndices[i]] = inputSample * 0.5 + feedback;
+      mDelayIndices[i] = (mDelayIndices[i] + 1) % mDelayLines[i].size();
+    }
+
+    // --- Upmix and Output ---
     for (size_t c = 0; c < numChannels; c++)
     {
-      double inputSample = inputs[c][s];
       double outSum = 0.0;
-
-      // Temporary array to hold the read values from delay lines
-      double readVals[8] = {0};
-
       for (int i = 0; i < kNumLines; i++)
       {
-        // Simple LFO modulation on the read length
-        double mod = std::sin(mLfoPhase + (i * kPI / 4.0)) * 5.0; // 5 samples depth
-        double readPos = static_cast<double>(mDelayIndices[i]) - static_cast<double>(mDelayLengths[i]) - mod;
-        while (readPos < 0.0) readPos += mDelayLines[i].size();
-
-        size_t idx1 = static_cast<size_t>(readPos);
-        size_t idx2 = (idx1 + 1) % mDelayLines[i].size();
-        double frac = readPos - idx1;
-
-        double val = mDelayLines[i][idx1] * (1.0 - frac) + mDelayLines[i][idx2] * frac;
-
-        // Apply 1-pole lowpass
-        mDelayLowpass[i] = mDelayLowpass[i] * (1.0 - lpfCoef) + val * lpfCoef;
-        readVals[i] = mDelayLowpass[i] * loopGain;
-
         // Accumulate to output (using alternating signs to spread stereo image)
         if (i % 2 == c % 2) {
              outSum += readVals[i];
@@ -121,20 +142,15 @@ DSP_SAMPLE** Reverb::Process(DSP_SAMPLE** inputs, const size_t numChannels, cons
         }
       }
 
-      // Mix matrix feedback
-      for (int i = 0; i < kNumLines; i++)
-      {
-        double feedback = 0.0;
-        for (int j = 0; j < kNumLines; j++) {
-            feedback += mixMatrix[i][j] * readVals[j];
-        }
-        
-        mDelayLines[i][mDelayIndices[i]] = inputSample * 0.5 + feedback;
-        mDelayIndices[i] = (mDelayIndices[i] + 1) % mDelayLines[i].size();
+      double finalSample = inputs[c][s] * (1.0 - mMix) + outSum * 0.3 * mMix;
+      
+      // NaN / Infinity protection to prevent ASIO driver hangs
+      if (std::isnan(finalSample) || std::isinf(finalSample)) {
+          finalSample = 0.0;
+          Reset(); // Reset delay lines if it blew up
       }
 
-      // Output mix
-      mOutputs[c][s] = static_cast<DSP_SAMPLE>(inputSample * (1.0 - mMix) + outSum * 0.3 * mMix);
+      mOutputs[c][s] = static_cast<DSP_SAMPLE>(finalSample);
     }
   }
 

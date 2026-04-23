@@ -26,7 +26,7 @@ public:
 private:
   void _PrepareBuffers(const size_t numChannels, const size_t numFrames) override;
 
-  double mSampleRate = 44100.0;
+  double mSampleRate = 0.0;
   double mMix = 0.5;
   double mDecay = 3.0;
   double mTone = 6.0;
