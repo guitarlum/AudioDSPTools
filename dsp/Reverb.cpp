@@ -142,7 +142,8 @@ DSP_SAMPLE** Reverb::Process(DSP_SAMPLE** inputs, const size_t numChannels, cons
         }
       }
 
-      double finalSample = inputs[c][s] * (1.0 - mMix) + outSum * 0.3 * mMix;
+      // Parallel mix: dry at unity, wet added on top
+      double finalSample = inputs[c][s] + outSum * 0.5 * mMix;
       
       // NaN / Infinity protection to prevent ASIO driver hangs
       if (std::isnan(finalSample) || std::isinf(finalSample)) {

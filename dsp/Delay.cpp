@@ -96,8 +96,8 @@ DSP_SAMPLE** Delay::Process(DSP_SAMPLE** inputs, const size_t numChannels, const
           delayedSample *= 0.95;
       }
 
-      // Output mix
-      double finalSample = inputSample * (1.0 - mMix) + delayedSample * mMix;
+      // Parallel mix: dry at unity, wet added on top (like a send/return)
+      double finalSample = inputSample + delayedSample * mMix;
 
       // NaN / Infinity protection
       if (std::isnan(finalSample) || std::isinf(finalSample)) {
