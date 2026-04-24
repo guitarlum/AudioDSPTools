@@ -1,6 +1,6 @@
 //
 //  Reverb.cpp
-//  VoLum
+//  VoLum — Hall (FDN) + Plate (Dattorro)
 //
 
 #include "Reverb.h"
@@ -14,42 +14,135 @@ namespace effect
 
 static constexpr double kPI = 3.14159265358979323846;
 
+// Scale a delay length from reference sample rate to actual
+static size_t ScaleDelay(double ms, double sr) { return std::max<size_t>(1, static_cast<size_t>(ms * sr / 1000.0)); }
+static size_t ScaleFromRef(size_t refLen, double refSR, double sr) { return std::max<size_t>(1, static_cast<size_t>(refLen * sr / refSR)); }
+
+// 1-pole lowpass tick: state = state*(1-c) + in*c; returns state
+static double LPTick(double& state, double in, double coef) { state += coef * (in - state); return state; }
+
+// Allpass tick (Moorer 2-multiply form): in-place buffer, returns output
+static double AllpassTick(std::vector<double>& buf, size_t& idx, size_t len, double input, double coef)
+{
+  if (len == 0 || buf.empty()) return input;
+  size_t bufSz = buf.size();
+  size_t readIdx = (idx + bufSz - len) % bufSz;
+  double delayed = buf[readIdx];
+  double v = input + coef * delayed;
+  buf[idx] = v;
+  idx = (idx + 1) % bufSz;
+  return delayed - coef * v;
+}
+
 Reverb::Reverb()
 {
-  mDelayLines.resize(kNumLines);
-  mDelayIndices.resize(kNumLines, 0);
-  mDelayLengths.resize(kNumLines, 0);
-  mDelayLowpass.resize(kNumLines, 0.0);
+  mHallDelays.resize(kHallLines);
+  mHallIndices.resize(kHallLines, 0);
+  mHallLengths.resize(kHallLines, 0);
+  mHallLPState.resize(kHallLines, 0.0);
+
+  mInputAPBuf.resize(kInputAPs);
+  mInputAPIdx.resize(kInputAPs, 0);
+  mInputAPLen.resize(kInputAPs, 0);
 }
 
 void Reverb::SetParams(double mix, double decay, double tone, int mode, double sampleRate)
 {
-  if (mSampleRate != sampleRate)
-  {
-    mSampleRate = sampleRate;
-    
-    // Primes in ms scaled to frames
-    const double baseLengthsMs[kNumLines] = { 31.0, 37.0, 43.0, 53.0, 61.0, 71.0, 79.0, 89.0 };
-    for (int i = 0; i < kNumLines; i++) {
-        mDelayLengths[i] = static_cast<size_t>((baseLengthsMs[i] / 1000.0) * mSampleRate) + 100; // +100 for modulation padding
-        mDelayLines[i].assign(mDelayLengths[i] + 500, 0.0); // +500 for safety padding
-        mDelayIndices[i] = 0;
-    }
-  }
-
+  bool srChanged = (mSampleRate != sampleRate);
+  mSampleRate = sampleRate;
   mMix = std::clamp(mix, 0.0, 1.0);
   mDecay = std::clamp(decay, 0.1, 10.0);
   mTone = std::clamp(tone, 0.0, 10.0);
   mMode = mode;
+
+  if (srChanged) {
+    mHallAllocated = false;
+    mPlateAllocated = false;
+  }
+
+  if (mMode > 1) mMode = 0;
+  if (mMode == 0 && !mHallAllocated) _AllocateHall();
+  if (mMode == 1 && !mPlateAllocated) _AllocatePlate();
+}
+
+void Reverb::_AllocateHall()
+{
+  const double baseLengthsMs[kHallLines] = { 31.0, 37.0, 43.0, 53.0, 61.0, 71.0, 79.0, 89.0 };
+  for (int i = 0; i < kHallLines; i++) {
+    mHallLengths[i] = ScaleDelay(baseLengthsMs[i], mSampleRate);
+    size_t bufSz = mHallLengths[i] + 200;
+    mHallDelays[i].assign(bufSz, 0.0);
+    mHallIndices[i] = 0;
+    mHallLPState[i] = 0.0;
+  }
+  mHallLfoPhase = 0.0;
+  mHallAllocated = true;
+}
+
+void Reverb::_AllocatePlate()
+{
+  // Dattorro reference rate = 29761 Hz
+  const double refSR = 29761.0;
+
+  // Input diffusion allpass lengths (at reference rate)
+  const size_t inputAPRef[kInputAPs] = { 142, 107, 379, 277 };
+  for (int i = 0; i < kInputAPs; i++) {
+    mInputAPLen[i] = ScaleFromRef(inputAPRef[i], refSR, mSampleRate);
+    mInputAPBuf[i].assign(mInputAPLen[i] + 16, 0.0);
+    mInputAPIdx[i] = 0;
+  }
+
+  // Tank half A: AP len=672, delay len=4453 (at ref rate)
+  // Tank half B: AP len=908, delay len=4217
+  const size_t tankAPRef[2] = { 672, 908 };
+  const size_t tankDelRef[2] = { 4453, 4217 };
+
+  for (int h = 0; h < 2; h++) {
+    mTank[h].apLen = ScaleFromRef(tankAPRef[h], refSR, mSampleRate);
+    mTank[h].apBuf.assign(mTank[h].apLen + 32, 0.0);
+    mTank[h].apIdx = 0;
+
+    mTank[h].delLen = ScaleFromRef(tankDelRef[h], refSR, mSampleRate);
+    mTank[h].delBuf.assign(mTank[h].delLen + 32, 0.0);
+    mTank[h].delIdx = 0;
+
+    mTank[h].lpState = 0.0;
+    mTank[h].lastOut = 0.0;
+  }
+
+  // Pre-delay (~10ms)
+  mPreDelayLen = ScaleDelay(10.0, mSampleRate);
+  mPreDelayBuf.assign(mPreDelayLen + 4, 0.0);
+  mPreDelayIdx = 0;
+  mInputLPState = 0.0;
+  mPlateLfoPhase = 0.0;
+  mPlateAllocated = true;
 }
 
 void Reverb::Reset()
 {
-  for (int i = 0; i < kNumLines; i++) {
-      std::fill(mDelayLines[i].begin(), mDelayLines[i].end(), 0.0);
-      mDelayIndices[i] = 0;
-      mDelayLowpass[i] = 0.0;
+  for (int i = 0; i < kHallLines; i++) {
+    std::fill(mHallDelays[i].begin(), mHallDelays[i].end(), 0.0);
+    mHallIndices[i] = 0;
+    mHallLPState[i] = 0.0;
   }
+  for (int i = 0; i < kInputAPs; i++) {
+    std::fill(mInputAPBuf[i].begin(), mInputAPBuf[i].end(), 0.0);
+    mInputAPIdx[i] = 0;
+  }
+  for (int h = 0; h < 2; h++) {
+    std::fill(mTank[h].apBuf.begin(), mTank[h].apBuf.end(), 0.0);
+    mTank[h].apIdx = 0;
+    std::fill(mTank[h].delBuf.begin(), mTank[h].delBuf.end(), 0.0);
+    mTank[h].delIdx = 0;
+    mTank[h].lpState = 0.0;
+    mTank[h].lastOut = 0.0;
+  }
+  std::fill(mPreDelayBuf.begin(), mPreDelayBuf.end(), 0.0);
+  mPreDelayIdx = 0;
+  mInputLPState = 0.0;
+  mHallLfoPhase = 0.0;
+  mPlateLfoPhase = 0.0;
 }
 
 void Reverb::_PrepareBuffers(const size_t numChannels, const size_t numFrames)
@@ -61,101 +154,191 @@ DSP_SAMPLE** Reverb::Process(DSP_SAMPLE** inputs, const size_t numChannels, cons
 {
   _PrepareBuffers(numChannels, numFrames);
 
-  // RT60 to loop gain
-  const double averageDelayTime = 58.0 / 1000.0; 
-  double loopGain = std::pow(10.0, -3.0 * averageDelayTime / mDecay);
-  if (loopGain >= 0.999) loopGain = 0.999;
-  
-  // Tone -> lowpass coefficient
-  // 0 -> heavy damping, 10 -> bright
-  double lpfCoef = 0.1 + (mTone / 10.0) * 0.8; 
+  if (mMode == 1)
+    _ProcessPlate(inputs, numChannels, numFrames);
+  else
+    _ProcessHall(inputs, numChannels, numFrames);
 
-  // Hadamard matrix for 8x8 mixing
-  const double H = 0.35355339; // 1 / sqrt(8)
-  double mixMatrix[8][8] = {
-      { H,  H,  H,  H,  H,  H,  H,  H},
-      { H, -H,  H, -H,  H, -H,  H, -H},
-      { H,  H, -H, -H,  H,  H, -H, -H},
-      { H, -H, -H,  H,  H, -H, -H,  H},
-      { H,  H,  H,  H, -H, -H, -H, -H},
-      { H, -H,  H, -H, -H,  H, -H,  H},
-      { H,  H, -H, -H, -H, -H,  H,  H},
-      { H, -H, -H,  H, -H,  H,  H, -H}
+  return _GetPointers();
+}
+
+// ─── Hall: improved 8-line FDN + Hadamard ─────────────────────────
+
+void Reverb::_ProcessHall(DSP_SAMPLE** inputs, const size_t numChannels, const size_t numFrames)
+{
+  // RT60 → loop gain
+  const double avgDelay = 58.0 / 1000.0;
+  double loopGain = std::pow(10.0, -3.0 * avgDelay / mDecay);
+  loopGain = std::min(loopGain, 0.998);
+
+  // Tone → LPF cutoff (mTone 0=dark, 10=bright)
+  double cutoffHz = 800.0 + (mTone / 10.0) * 12000.0;
+  double rc = 1.0 / (2.0 * kPI * cutoffHz);
+  double dt = 1.0 / mSampleRate;
+  double lpCoef = dt / (rc + dt);
+
+  // Hadamard 8x8 (1/sqrt(8))
+  const double H = 0.35355339;
+  static const double mixMat[8][8] = {
+    { H,  H,  H,  H,  H,  H,  H,  H},
+    { H, -H,  H, -H,  H, -H,  H, -H},
+    { H,  H, -H, -H,  H,  H, -H, -H},
+    { H, -H, -H,  H,  H, -H, -H,  H},
+    { H,  H,  H,  H, -H, -H, -H, -H},
+    { H, -H,  H, -H, -H,  H, -H,  H},
+    { H,  H, -H, -H, -H, -H,  H,  H},
+    { H, -H, -H,  H, -H,  H,  H, -H}
   };
+
+  // LFO rate: 0.6 Hz, depth: 10 samples
+  const double lfoRate = 0.6 * 2.0 * kPI / mSampleRate;
+  const double lfoDepth = 10.0;
 
   for (size_t s = 0; s < numFrames; s++)
   {
-    mLfoPhase += 0.5 * 2.0 * kPI / mSampleRate; // 0.5 Hz LFO
-    if (mLfoPhase > 2.0 * kPI) mLfoPhase -= 2.0 * kPI;
+    mHallLfoPhase += lfoRate;
+    if (mHallLfoPhase > 2.0 * kPI) mHallLfoPhase -= 2.0 * kPI;
 
-    // Downmix stereo input to mono for the FDN
-    double inputSample = 0.0;
-    for (size_t c = 0; c < numChannels; c++) {
-      inputSample += inputs[c][s];
-    }
-    if (numChannels > 0) inputSample /= static_cast<double>(numChannels);
+    // Mono downmix
+    double in = 0.0;
+    for (size_t c = 0; c < numChannels; c++) in += inputs[c][s];
+    if (numChannels > 1) in *= 0.5;
 
-    // --- FDN Processing (Strictly ONCE per frame) ---
-    double readVals[8] = {0};
-
-    for (int i = 0; i < kNumLines; i++)
+    // Read delay lines with modulation
+    double readVals[8];
+    for (int i = 0; i < kHallLines; i++)
     {
-      // Simple LFO modulation on the read length
-      double mod = std::sin(mLfoPhase + (i * kPI / 4.0)) * 5.0; // 5 samples depth
-      double readPos = static_cast<double>(mDelayIndices[i]) - static_cast<double>(mDelayLengths[i]) - mod;
-      while (readPos < 0.0) readPos += mDelayLines[i].size();
+      double mod = std::sin(mHallLfoPhase + i * kPI * 0.25) * lfoDepth;
+      double readPos = (double)mHallIndices[i] - (double)mHallLengths[i] - mod;
+      size_t bufSz = mHallDelays[i].size();
+      while (readPos < 0.0) readPos += bufSz;
+      size_t i0 = (size_t)readPos % bufSz;
+      size_t i1 = (i0 + 1) % bufSz;
+      double frac = readPos - std::floor(readPos);
+      double val = mHallDelays[i][i0] * (1.0 - frac) + mHallDelays[i][i1] * frac;
 
-      size_t idx1 = static_cast<size_t>(readPos);
-      size_t idx2 = (idx1 + 1) % mDelayLines[i].size();
-      double frac = readPos - idx1;
-
-      double val = mDelayLines[i][idx1] * (1.0 - frac) + mDelayLines[i][idx2] * frac;
-
-      // Apply 1-pole lowpass
-      mDelayLowpass[i] = mDelayLowpass[i] * (1.0 - lpfCoef) + val * lpfCoef;
-      readVals[i] = mDelayLowpass[i] * loopGain;
+      LPTick(mHallLPState[i], val, lpCoef);
+      readVals[i] = mHallLPState[i] * loopGain;
     }
 
-    // Mix matrix feedback
-    for (int i = 0; i < kNumLines; i++)
+    // Matrix feedback + write
+    for (int i = 0; i < kHallLines; i++)
     {
-      double feedback = 0.0;
-      for (int j = 0; j < kNumLines; j++) {
-          feedback += mixMatrix[i][j] * readVals[j];
-      }
-      
-      mDelayLines[i][mDelayIndices[i]] = inputSample * 0.5 + feedback;
-      mDelayIndices[i] = (mDelayIndices[i] + 1) % mDelayLines[i].size();
+      double fb = 0.0;
+      for (int j = 0; j < kHallLines; j++) fb += mixMat[i][j] * readVals[j];
+      mHallDelays[i][mHallIndices[i]] = in * 0.5 + fb;
+      mHallIndices[i] = (mHallIndices[i] + 1) % mHallDelays[i].size();
     }
 
-    // --- Upmix and Output ---
+    // Stereo output: decorrelated taps
+    double outL = (readVals[0] + readVals[2] - readVals[4] + readVals[6]) * 0.5;
+    double outR = (readVals[1] - readVals[3] + readVals[5] + readVals[7]) * 0.5;
+
     for (size_t c = 0; c < numChannels; c++)
     {
-      double outSum = 0.0;
-      for (int i = 0; i < kNumLines; i++)
-      {
-        // Accumulate to output (using alternating signs to spread stereo image)
-        if (i % 2 == c % 2) {
-             outSum += readVals[i];
-        } else {
-             outSum -= readVals[i];
-        }
-      }
-
-      // Parallel mix: dry at unity, wet added on top
-      double finalSample = inputs[c][s] + outSum * 0.5 * mMix;
-      
-      // NaN / Infinity protection to prevent ASIO driver hangs
-      if (std::isnan(finalSample) || std::isinf(finalSample)) {
-          finalSample = 0.0;
-          Reset(); // Reset delay lines if it blew up
-      }
-
-      mOutputs[c][s] = static_cast<DSP_SAMPLE>(finalSample);
+      double wet = (c == 0) ? outL : outR;
+      double final_ = inputs[c][s] + wet * mMix;
+      if (std::isnan(final_) || std::isinf(final_)) { final_ = 0.0; Reset(); }
+      mOutputs[c][s] = static_cast<DSP_SAMPLE>(final_);
     }
   }
+}
 
-  return _GetPointers();
+// ─── Plate: Dattorro allpass-loop reverb ──────────────────────────
+
+void Reverb::_ProcessPlate(DSP_SAMPLE** inputs, const size_t numChannels, const size_t numFrames)
+{
+  // Input diffusion coefficients (from Dattorro paper)
+  const double inDiff1 = 0.75;
+  const double inDiff2 = 0.625;
+  const double inDiffCoefs[kInputAPs] = { inDiff1, inDiff1, inDiff2, inDiff2 };
+
+  // Decay → tank feedback gain
+  double decayGain = std::clamp(1.0 - (1.0 / (mDecay + 0.1)), 0.1, 0.97);
+
+  // Decay diffusion
+  double decayDiff = 0.7;
+
+  // Tone → damping LPF (same approach as hall)
+  double cutoffHz = 1000.0 + (mTone / 10.0) * 14000.0;
+  double rc = 1.0 / (2.0 * kPI * cutoffHz);
+  double dt = 1.0 / mSampleRate;
+  double dampCoef = dt / (rc + dt);
+
+  // Input bandwidth LPF
+  double bwCoef = 0.9995;
+
+  // Tank modulation: ~1 Hz, excursion ~16 samples scaled to sample rate
+  double modRate = 1.0 * 2.0 * kPI / mSampleRate;
+  double modDepth = 16.0 * mSampleRate / 29761.0;
+
+  for (size_t s = 0; s < numFrames; s++)
+  {
+    mPlateLfoPhase += modRate;
+    if (mPlateLfoPhase > 2.0 * kPI) mPlateLfoPhase -= 2.0 * kPI;
+
+    // Mono downmix
+    double in = 0.0;
+    for (size_t c = 0; c < numChannels; c++) in += inputs[c][s];
+    if (numChannels > 1) in *= 0.5;
+
+    // Pre-delay
+    size_t preReadIdx = (mPreDelayIdx + mPreDelayBuf.size() - mPreDelayLen) % mPreDelayBuf.size();
+    double preOut = mPreDelayBuf[preReadIdx];
+    mPreDelayBuf[mPreDelayIdx] = in;
+    mPreDelayIdx = (mPreDelayIdx + 1) % mPreDelayBuf.size();
+
+    // Input bandwidth filter
+    LPTick(mInputLPState, preOut, bwCoef);
+    double sig = mInputLPState;
+
+    // 4x input diffusion allpass
+    for (int i = 0; i < kInputAPs; i++)
+      sig = AllpassTick(mInputAPBuf[i], mInputAPIdx[i], mInputAPLen[i], sig, inDiffCoefs[i]);
+
+    // Feed into tank (cross-coupled)
+    double tankInA = sig + mTank[1].lastOut * decayGain;
+    double tankInB = sig + mTank[0].lastOut * decayGain;
+
+    // Process each tank half: AP → modulated delay → damping LP
+    for (int h = 0; h < 2; h++)
+    {
+      double tankIn = (h == 0) ? tankInA : tankInB;
+
+      // Decay diffusor allpass
+      double apOut = AllpassTick(mTank[h].apBuf, mTank[h].apIdx, mTank[h].apLen, tankIn, decayDiff);
+
+      // Modulated delay read
+      double mod = std::sin(mPlateLfoPhase + h * kPI) * modDepth;
+      double readPos = (double)mTank[h].delIdx - (double)mTank[h].delLen - mod;
+      size_t bufSz = mTank[h].delBuf.size();
+      while (readPos < 0.0) readPos += bufSz;
+      size_t i0 = (size_t)readPos % bufSz;
+      size_t i1 = (i0 + 1) % bufSz;
+      double frac = readPos - std::floor(readPos);
+      double delOut = mTank[h].delBuf[i0] * (1.0 - frac) + mTank[h].delBuf[i1] * frac;
+
+      // Write AP output into delay
+      mTank[h].delBuf[mTank[h].delIdx] = apOut;
+      mTank[h].delIdx = (mTank[h].delIdx + 1) % bufSz;
+
+      // Damping lowpass
+      LPTick(mTank[h].lpState, delOut, dampCoef);
+      mTank[h].lastOut = mTank[h].lpState;
+    }
+
+    // Output: taps from both tank halves for stereo decorrelation
+    double outL = mTank[0].lastOut * 0.6 + mTank[1].lastOut * 0.4;
+    double outR = mTank[1].lastOut * 0.6 + mTank[0].lastOut * 0.4;
+
+    for (size_t c = 0; c < numChannels; c++)
+    {
+      double wet = (c == 0) ? outL : outR;
+      double final_ = inputs[c][s] + wet * mMix;
+      if (std::isnan(final_) || std::isinf(final_)) { final_ = 0.0; Reset(); }
+      mOutputs[c][s] = static_cast<DSP_SAMPLE>(final_);
+    }
+  }
 }
 
 } // namespace effect
