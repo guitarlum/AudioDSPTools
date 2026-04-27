@@ -1,6 +1,6 @@
 //
 //  Reverb.h
-//  VoLum — Hall (FDN) + Plate (Dattorro) reverb
+//  VoLum - Hall (FDN), Plate (Dattorro), Oktaverb
 //
 
 #pragma once
@@ -18,8 +18,8 @@ class Reverb : public DSP
 public:
   Reverb();
 
-  // mode: 0=Hall, 1=Plate
-  void SetParams(double mix, double decay, double tone, int mode, double sampleRate);
+  // mode: 0=Hall, 1=Plate, 2=Oktaverb
+  void SetParams(double mix, double decay, double tone, double preDelayMs, double shimmer, int mode, double sampleRate);
   void Reset();
 
   DSP_SAMPLE** Process(DSP_SAMPLE** inputs, const size_t numChannels, const size_t numFrames) override;
@@ -29,17 +29,24 @@ private:
 
   void _ProcessHall(DSP_SAMPLE** inputs, const size_t numChannels, const size_t numFrames);
   void _ProcessPlate(DSP_SAMPLE** inputs, const size_t numChannels, const size_t numFrames);
+  void _ProcessOktaverb(DSP_SAMPLE** inputs, const size_t numChannels, const size_t numFrames);
 
   void _AllocateHall();
   void _AllocatePlate();
+  void _AllocateOktaverb();
+  void _AllocatePreDelay();
+  double _ReadWritePreDelay(double input);
+  double _PitchDownOctaveTick(int line, double input);
 
   double mSampleRate = 0.0;
-  double mMix = 0.5;
+  double mMix = 0.3;
   double mDecay = 3.0;
-  double mTone = 6.0;
-  int mMode = 0; // 0=Hall, 1=Plate
+  double mTone = 4.5;
+  double mPreDelayMs = 20.0;
+  double mShimmer = 0.5;
+  int mMode = 0; // 0=Hall, 1=Plate, 2=Oktaverb
 
-  // ─── Hall (8-line FDN + Hadamard) ────────────────────────────
+  // Hall (8-line FDN + Hadamard)
   static const int kHallLines = 8;
   std::vector<std::vector<double>> mHallDelays;
   std::vector<size_t> mHallIndices;
@@ -47,7 +54,12 @@ private:
   std::vector<double> mHallLPState;
   double mHallLfoPhase = 0.0;
 
-  // ─── Plate (Dattorro) ────────────────────────────────────────
+  // Oktaverb pitch shifter state, one shifter per FDN feedback line.
+  std::vector<std::vector<double>> mOktPitchBufs;
+  std::vector<size_t> mOktPitchWriteIdx;
+  std::vector<double> mOktPitchPhase;
+
+  // Plate (Dattorro)
   // Input diffusion: 4 allpass filters
   static const int kInputAPs = 4;
   std::vector<std::vector<double>> mInputAPBuf;
@@ -72,7 +84,7 @@ private:
   // Modulation
   double mPlateLfoPhase = 0.0;
 
-  // Pre-delay
+  // Shared pre-delay
   std::vector<double> mPreDelayBuf;
   size_t mPreDelayIdx = 0;
   size_t mPreDelayLen = 0;
@@ -82,6 +94,7 @@ private:
 
   bool mHallAllocated = false;
   bool mPlateAllocated = false;
+  bool mOktaverbAllocated = false;
 };
 
 } // namespace effect
