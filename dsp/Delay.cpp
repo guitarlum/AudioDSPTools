@@ -16,15 +16,18 @@ Delay::Delay()
 {
 }
 
+void Delay::Prepare(const size_t numChannels, const size_t numFrames, double sampleRate)
+{
+  mSampleRate = sampleRate;
+  _PrepareBuffers(numChannels, numFrames);
+}
+
 void Delay::SetParams(double timeMs, double feedback, double mix, int mode, double sampleRate)
 {
   if (mSampleRate != sampleRate)
   {
     mSampleRate = sampleRate;
-    for (auto& buf : mBuffer)
-    {
-      buf.assign(_GetMaxFrames(), 0.0);
-    }
+    _PrepareDelayLines(mBuffer.size());
     mWriteIndex = 0;
   }
 
@@ -50,10 +53,19 @@ void Delay::Reset()
 void Delay::_PrepareBuffers(const size_t numChannels, const size_t numFrames)
 {
   this->DSP::_PrepareBuffers(numChannels, numFrames);
-  
+  _PrepareDelayLines(numChannels);
+}
+
+void Delay::_PrepareDelayLines(const size_t numChannels)
+{
+  const size_t maxFrames = _GetMaxFrames();
   if (mBuffer.size() != numChannels)
+    mBuffer.resize(numChannels);
+
+  for (auto& buf : mBuffer)
   {
-    mBuffer.resize(numChannels, std::vector<double>(_GetMaxFrames(), 0.0));
+    if (buf.size() != maxFrames)
+      buf.assign(maxFrames, 0.0);
   }
 }
 
@@ -115,6 +127,11 @@ DSP_SAMPLE** Delay::Process(DSP_SAMPLE** inputs, const size_t numChannels, const
   }
 
   return _GetPointers();
+}
+
+size_t Delay::_GetMaxFrames() const
+{
+  return std::max<size_t>(1, static_cast<size_t>(2.0 * mSampleRate));
 }
 
 } // namespace effect

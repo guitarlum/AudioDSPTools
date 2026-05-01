@@ -19,6 +19,7 @@ public:
   Reverb();
 
   // mode: 0=Hall, 1=Plate, 2=Oktaverb
+  void Prepare(const size_t numChannels, const size_t numFrames, double sampleRate);
   void SetParams(double mix, double decay, double tone, double preDelayMs, double shimmer, int mode, double sampleRate);
   void Reset();
 
@@ -35,6 +36,7 @@ private:
   void _AllocatePlate();
   void _AllocateOktaverb();
   void _AllocatePreDelay();
+  void _SetPreDelayLength(double preDelayMs);
   double _ReadWritePreDelay(double input);
   double _PitchDownOctaveTick(int line, double input);
 

@@ -52,16 +52,38 @@ Reverb::Reverb()
   mOktPitchPhase.resize(kHallLines, 0.0);
 }
 
+void Reverb::Prepare(const size_t numChannels, const size_t numFrames, double sampleRate)
+{
+  const bool srChanged = (mSampleRate != sampleRate);
+  mSampleRate = sampleRate;
+  _PrepareBuffers(numChannels, numFrames);
+
+  if (srChanged)
+  {
+    mHallAllocated = false;
+    mPlateAllocated = false;
+    mOktaverbAllocated = false;
+    _AllocatePreDelay();
+  }
+  else if (mPreDelayBuf.empty())
+  {
+    _AllocatePreDelay();
+  }
+
+  if (!mHallAllocated) _AllocateHall();
+  if (!mPlateAllocated) _AllocatePlate();
+  if (!mOktaverbAllocated) _AllocateOktaverb();
+}
+
 void Reverb::SetParams(double mix, double decay, double tone, double preDelayMs, double shimmer, int mode, double sampleRate)
 {
   const bool srChanged = (mSampleRate != sampleRate);
   const double clampedPreDelayMs = std::clamp(preDelayMs, 0.0, 80.0);
-  const bool preDelayChanged = (mPreDelayMs != clampedPreDelayMs);
   mSampleRate = sampleRate;
   mMix = std::clamp(mix, 0.0, 1.0);
   mDecay = std::clamp(decay, 0.1, 10.0);
   mTone = std::clamp(tone, 0.0, 10.0);
-  mPreDelayMs = clampedPreDelayMs;
+  _SetPreDelayLength(clampedPreDelayMs);
   mShimmer = std::clamp(shimmer, 0.0, 1.0);
   mMode = mode;
 
@@ -71,7 +93,7 @@ void Reverb::SetParams(double mix, double decay, double tone, double preDelayMs,
     mOktaverbAllocated = false;
     _AllocatePreDelay();
   }
-  else if (preDelayChanged || mPreDelayBuf.empty()) {
+  else if (mPreDelayBuf.empty()) {
     _AllocatePreDelay();
   }
 
@@ -86,9 +108,18 @@ void Reverb::SetParams(double mix, double decay, double tone, double preDelayMs,
 
 void Reverb::_AllocatePreDelay()
 {
+  const size_t maxPreDelayLen = ScaleDelay(80.0, mSampleRate);
   mPreDelayLen = static_cast<size_t>(mPreDelayMs * mSampleRate / 1000.0);
-  mPreDelayBuf.assign(mPreDelayLen + 4, 0.0);
+  mPreDelayBuf.assign(maxPreDelayLen + 4, 0.0);
   mPreDelayIdx = 0;
+}
+
+void Reverb::_SetPreDelayLength(double preDelayMs)
+{
+  mPreDelayMs = preDelayMs;
+  mPreDelayLen = static_cast<size_t>(mPreDelayMs * mSampleRate / 1000.0);
+  if (!mPreDelayBuf.empty() && mPreDelayLen >= mPreDelayBuf.size())
+    mPreDelayLen = mPreDelayBuf.size() - 1;
 }
 
 void Reverb::_AllocateHall()

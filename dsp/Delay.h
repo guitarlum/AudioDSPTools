@@ -18,6 +18,7 @@ class Delay : public DSP
 public:
   Delay();
 
+  void Prepare(const size_t numChannels, const size_t numFrames, double sampleRate);
   void SetParams(double timeMs, double feedback, double mix, int mode, double sampleRate);
   void Reset();
 
@@ -25,6 +26,7 @@ public:
 
 private:
   void _PrepareBuffers(const size_t numChannels, const size_t numFrames) override;
+  void _PrepareDelayLines(const size_t numChannels);
 
   double mSampleRate = 0.0;
   double mTimeMs = 380.0;
@@ -41,7 +43,7 @@ private:
   size_t mWriteIndex = 0;
 
   // Max delay of 2000 ms at 192kHz ~ 384000 samples. We'll size dynamically based on sample rate.
-  size_t _GetMaxFrames() const { return static_cast<size_t>(2.0 * mSampleRate); }
+  size_t _GetMaxFrames() const;
 };
 
 } // namespace effect
