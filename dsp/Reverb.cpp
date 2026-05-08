@@ -19,7 +19,28 @@ static size_t ScaleDelay(double ms, double sr) { return std::max<size_t>(1, stat
 static size_t ScaleFromRef(size_t refLen, double refSR, double sr) { return std::max<size_t>(1, static_cast<size_t>(refLen * sr / refSR)); }
 static double Hann(double phase) { return 0.5 - 0.5 * std::cos(kTwoPI * phase); }
 
+static double Hash01(unsigned int x)
+{
+  x ^= x >> 16;
+  x *= 0x7feb352dU;
+  x ^= x >> 15;
+  x *= 0x846ca68bU;
+  x ^= x >> 16;
+  return static_cast<double>(x & 0x00ffffffU) / static_cast<double>(0x01000000U);
+}
+
 static double LPTick(double& state, double in, double coef) { state += coef * (in - state); return state; }
+
+// Soft saturator used only by Oktaverb. Bounded in (-1, +1) for any finite input thanks
+// to std::tanh; effectively transparent below ~0.3, gentle compression above, hard
+// ceiling at unity. Catches DSP buildup (long decay, dual-pitch feedback, bloom envelope
+// * wet gain) so the Oktaverb wet bus cannot rail. Hall and Plate intentionally do NOT
+// run through this; the user explicitly liked the original additive Hall / Plate sound,
+// and they never had the pitch-feedback runaway pathology that motivated the saturator.
+static double SoftSaturate(double x)
+{
+  return std::tanh(x);
+}
 
 static double AllpassTick(std::vector<double>& buf, size_t& idx, size_t len, double input, double coef)
 {
@@ -57,32 +78,60 @@ HallSubModeChar GetHallSubMode(int sub)
   }
 }
 
+constexpr double kOctaveUpRatio = 2.0;
+constexpr double kOctaveDownRatio = 0.5;
+constexpr double kSubFifthDownRatio = 0.6674199270850172; // -7 semitones
+
 // Oktaverb sub-mode:
-//   0 = Oct (octave up only)
-//   1 = Oct + Fifth
-//   2 = Oct + SubOct
+//   0 = Dark (-12 feedback + parallel sub-fifth)
+//   1 = Shimmer (+12 feedback)
+//   2 = Bloom (slow attack, no pitched feedback)
 struct OktaverbSubModeChar
 {
-  double octGain;
-  double fifthGain;
-  double subOctGain;
-  double pitchedPreDelayMs;
+  // Primary feedback pitch voice (always single-voice in Shimmer; one half of the
+  // dual pair in Halo). Bloom uses ratio 1.0 / gain 0.0 to disable.
+  double feedbackPitchRatio;
+  double feedbackPitchGain;
+  // Optional secondary feedback pitch voice. Used by Halo to inject -12 alongside
+  // the primary +12 so the tank is excited by both directions simultaneously.
+  // gain == 0 disables the second voice (Shimmer / Bloom).
+  double secondaryFeedbackPitchRatio;
+  double secondaryFeedbackPitchGain;
+  // Parallel pitch voice (added to wet output, never re-enters the tank). gain == 0
+  // disables it. Currently unused by Halo and Shimmer; kept for future voicings.
+  double parallelPitchRatio;
+  double parallelPitchGain;
+  double inputGain;
+  double cutoffMinHz;
+  double cutoffMidHz;
+  double cutoffMaxHz;
+  double modulationDepth;
+  double wetWidth;
+  double wetGain;
+  bool bloom;
 };
 
 OktaverbSubModeChar GetOktaverbSubMode(int sub)
 {
   switch (sub)
   {
-    case 1: return {1.0, 0.75, 0.0, 80.0};
-    case 2: return {0.9, 0.0, 0.8, 50.0};
+    // Shimmer: bright FDN, +12 in feedback as the spine, no secondary voice, parallel +12
+    // voice for body lift, wet boosted so Mix at ~30 percent reads over the dry amp signal.
+    case 1: return {kOctaveUpRatio, 0.42, 1.0, 0.0, kOctaveUpRatio, 0.32,
+                    0.75, 1200.0, 5000.0, 12000.0, 14.0, 1.10, 1.55, false};
+    // Bloom: no pitch shifting, swell-driven envelope. Skips the safety saturators in
+    // _ProcessOktaverb (it has no pitch-feedback runaway pathology) so the wetGain is
+    // tuned conservatively here to stay well clear of clipping under realistic input.
+    case 2: return {1.0, 0.0, 1.0, 0.0, 1.0, 0.0,
+                    0.50, 1200.0, 4700.0, 9500.0, 9.0, 1.25, 1.40, true};
     case 0:
-    default: return {1.2, 0.0, 0.0, 70.0};
+    // Halo (Dual): both +12 and -12 in the feedback loop simultaneously (Valhalla Dual
+    // / Meris Pitch Vector lineage). Bright FDN keeps the body audible; -12 brings the
+    // doom-octave weight without burying the high-end. No parallel voice.
+    default: return {kOctaveUpRatio, 0.30, kOctaveDownRatio, 0.30, 1.0, 0.0,
+                     0.78, 1100.0, 4600.0, 11000.0, 11.0, 1.05, 1.55, false};
   }
 }
-
-constexpr double kFifthRatio = 1.4983;
-constexpr double kOctaveUpRatio = 2.0;
-constexpr double kOctaveDownRatio = 0.5;
 
 } // namespace
 
@@ -111,6 +160,10 @@ Reverb::Reverb()
   mPitchedPreBuf.resize(kHallLines);
   mPitchedPreIdx.assign(kHallLines, 0);
   mPitchedDetunePhase.assign(kHallLines, 0.0);
+  mOktaverbLfoPhase.assign(kHallLines, 0.0);
+  mOktaverbPitchLPState.assign(kHallLines, 0.0);
+  mOktaverbFeedbackPitchLPState.assign(kHallLines, 0.0);
+  mOktaverbFeedbackPitchHPState.assign(kHallLines, 0.0);
 }
 
 void Reverb::Prepare(const size_t numChannels, const size_t numFrames, double sampleRate)
@@ -219,7 +272,7 @@ void Reverb::_AllocateHall()
 
 void Reverb::_AllocateOktaverb()
 {
-  const size_t grainLen = std::max<size_t>(64, ScaleDelay(60.0, mSampleRate));
+  const size_t grainLen = std::max<size_t>(64, ScaleDelay(100.0, mSampleRate));
   for (int v = 0; v < kNumPitchVoices; v++)
   {
     for (int i = 0; i < kHallLines; i++)
@@ -236,7 +289,13 @@ void Reverb::_AllocateOktaverb()
     mPitchedPreBuf[i].assign(maxPitchedPre + 4, 0.0);
     mPitchedPreIdx[i] = 0;
     mPitchedDetunePhase[i] = static_cast<double>(i) / kHallLines; // staggered phase
+    mOktaverbLfoPhase[i] = static_cast<double>(i) / kHallLines;
+    mOktaverbPitchLPState[i] = 0.0;
+    mOktaverbFeedbackPitchLPState[i] = 0.0;
+    mOktaverbFeedbackPitchHPState[i] = 0.0;
   }
+  mBloomEnv = 0.0;
+  mBloomVCA = 0.0;
   mOktaverbAllocated = true;
 }
 
@@ -312,7 +371,13 @@ void Reverb::Reset()
     std::fill(mPitchedPreBuf[i].begin(), mPitchedPreBuf[i].end(), 0.0);
     mPitchedPreIdx[i] = 0;
     mPitchedDetunePhase[i] = static_cast<double>(i) / kHallLines;
+    mOktaverbLfoPhase[i] = static_cast<double>(i) / kHallLines;
+    mOktaverbPitchLPState[i] = 0.0;
+    mOktaverbFeedbackPitchLPState[i] = 0.0;
+    mOktaverbFeedbackPitchHPState[i] = 0.0;
   }
+  mBloomEnv = 0.0;
+  mBloomVCA = 0.0;
   mInputLPState = 0.0;
   mHallLfoPhase = 0.0;
   mPlateLfoPhase = 0.0;
@@ -364,8 +429,8 @@ double Reverb::_PitchShiftTick(int voice, int line, double input, double ratio)
 
   buf[writeIdx] = input;
 
-  auto readFrac = [&](double grainPhase) {
-    const double delay = 1.0 + grainPhase * static_cast<double>(grainLen);
+  auto readFrac = [&](double grainPhase, double jitterFrames) {
+    const double delay = 1.0 + grainPhase * static_cast<double>(grainLen) + jitterFrames;
     double readPos = static_cast<double>(writeIdx) - delay;
     while (readPos < 0.0)
       readPos += static_cast<double>(buf.size());
@@ -375,12 +440,25 @@ double Reverb::_PitchShiftTick(int voice, int line, double input, double ratio)
     return buf[i0] * (1.0 - frac) + buf[i1] * frac;
   };
 
-  const double phaseB = phase + 0.5 >= 1.0 ? phase - 0.5 : phase + 0.5;
-  const double a = readFrac(phase);
-  const double b = readFrac(phaseB);
-  const double wA = Hann(phase);
-  const double wB = Hann(phaseB);
-  const double out = (a * wA + b * wB) / std::max(0.000001, wA + wB);
+  double sum = 0.0;
+  double weight = 0.0;
+  for (int grain = 0; grain < 3; ++grain)
+  {
+    double grainPhase = phase + static_cast<double>(grain) / 3.0;
+    while (grainPhase >= 1.0)
+      grainPhase -= 1.0;
+
+    const double randA = Hash01(static_cast<unsigned int>((voice + 1) * 92821 + (line + 1) * 68917 + grain * 31337));
+    const double randB = Hash01(static_cast<unsigned int>((voice + 5) * 19319 + (line + 3) * 49157 + grain * 27191));
+    const double jitterFrames = randA * 0.008 * mSampleRate; // 0..8 ms splice offset
+    const double detuneCents = (randB - 0.5) * 16.0; // +/-8 cents
+    const double detuneRatio = std::pow(2.0, detuneCents / 1200.0);
+    const double sample = readFrac(grainPhase, jitterFrames * detuneRatio);
+    const double w = Hann(grainPhase);
+    sum += sample * w;
+    weight += w;
+  }
+  const double out = sum / std::max(0.000001, weight);
 
   writeIdx = (writeIdx + 1) % buf.size();
   // Moving the read delay shorter makes the read pointer travel faster (pitch up);
@@ -530,12 +608,21 @@ void Reverb::_ProcessOktaverb(DSP_SAMPLE** inputs, const size_t numChannels, con
 
   const double avgDelay = 58.0 / 1000.0;
   double loopGain = std::pow(10.0, -3.0 * avgDelay / mDecay);
-  loopGain = std::min(loopGain, 0.998);
+  loopGain = std::min(loopGain, sm.bloom ? 0.996 : 0.985);
 
-  const double cutoffHz = _ToneToCutoff(1500.0, 5000.0, 10000.0);
+  const double cutoffHz = _ToneToCutoff(sm.cutoffMinHz, sm.cutoffMidHz, sm.cutoffMaxHz);
   const double rc = 1.0 / (2.0 * kPI * cutoffHz);
   const double dt = 1.0 / mSampleRate;
   const double lpCoef = dt / (rc + dt);
+
+  const double pitchCutoffHz = std::clamp(cutoffHz * (mSubMode == 0 ? 0.70 : 0.85), 120.0, 8500.0);
+  const double pitchRc = 1.0 / (2.0 * kPI * pitchCutoffHz);
+  const double pitchLpCoef = dt / (pitchRc + dt);
+  // Halo (slot 0) carries the -12 voice and needs a real HP to prevent sub-bass build-up
+  // in the FB loop; Shimmer (slot 1) is +12-only and wants a higher HP for clarity; Bloom
+  // doesn't use the path so the value is moot.
+  const double pitchHpCutoffHz = (mSubMode == 1) ? 180.0 : (mSubMode == 0) ? 120.0 : 45.0;
+  const double pitchHpLpCoef = 1.0 - std::exp(-2.0 * kPI * pitchHpCutoffHz / mSampleRate);
 
   const double H = 0.35355339;
   static const double mixMat[8][8] = {
@@ -548,37 +635,39 @@ void Reverb::_ProcessOktaverb(DSP_SAMPLE** inputs, const size_t numChannels, con
     {H, H, -H, -H, -H, -H, H, H},
     {H, -H, -H, H, -H, H, H, -H}};
 
-  const double lfoRate = 0.6 * 2.0 * kPI / mSampleRate;
-  const double lfoDepth = 10.0;
+  static const double lfoRatesHz[kHallLines] = {0.31, 0.43, 0.57, 0.71, 0.83, 0.97, 1.13, 1.29};
+  const double intensity = std::clamp(mShimmer, 0.0, 1.0);
+  // Sub-linear curve so the lower 50 percent of the knob already moves the pitch level
+  // perceptibly; user feedback was that the knob "didn't seem to do too much" at the top.
+  const double intensityCurved = std::pow(intensity, 0.7);
+  const double feedbackPitchGain = sm.feedbackPitchGain * (0.10 + 0.90 * intensityCurved);
+  const double secondaryFeedbackPitchGain = sm.secondaryFeedbackPitchGain * (0.10 + 0.90 * intensityCurved);
+  // Parallel pitch always present at a small floor so the voicing colour reads even with
+  // intensity at zero; Bloom / Halo keep parallel gain at zero via sm.parallelPitchGain.
+  const double parallelPitchGain = sm.parallelPitchGain * (0.20 + 0.80 * intensityCurved);
 
-  // Retuned shimmer curve: shimmer^1.5 makes 0.3 perceptually meaningful while still
-  // letting cranked settings push hard.
-  const double shimmerCurved = std::pow(mShimmer, 1.5);
-  const double shimmerOutput = shimmerCurved * 0.95;
-
-  // Pitched pre-delay frames.
-  const size_t pitchedPreDelayFrames = ScaleDelay(sm.pitchedPreDelayMs, mSampleRate);
-
-  // Per-line detune motion (3-6 cents at 0.3-0.5 Hz).
-  const double detuneRateHz = 0.4;
-  const double detuneCentDepth = 4.5;
-  const double centsToFrameFrac = (detuneCentDepth / 1200.0); // tiny per-sample shift
+  const double bloomAttackMs = 50.0 + 1950.0 * intensityCurved;
+  const double bloomAttackCoef = 1.0 - std::exp(-1.0 / (std::max(1.0, bloomAttackMs) * 0.001 * mSampleRate));
+  const double bloomReleaseCoef = 1.0 - std::exp(-1.0 / (1.8 * mSampleRate));
+  const double bloomEnvAttackCoef = 1.0 - std::exp(-1.0 / (0.005 * mSampleRate));
+  const double bloomEnvReleaseCoef = 1.0 - std::exp(-1.0 / (1.2 * mSampleRate));
 
   for (size_t s = 0; s < numFrames; s++)
   {
-    mHallLfoPhase += lfoRate;
-    if (mHallLfoPhase > 2.0 * kPI) mHallLfoPhase -= 2.0 * kPI;
-
     double in = 0.0;
     for (size_t c = 0; c < numChannels; c++) in += inputs[c][s];
     if (numChannels > 1) in *= 0.5;
     in = _ReadWritePreDelay(in);
 
     double readVals[8];
-    double pitchedVals[8];
+    double parallelPitchVals[8];
     for (int i = 0; i < kHallLines; i++)
     {
-      const double mod = std::sin(mHallLfoPhase + i * kPI * 0.25) * lfoDepth;
+      const double rate = lfoRatesHz[i] * ((i & 1) ? 1.02 : 0.98);
+      mOktaverbLfoPhase[i] += rate / mSampleRate;
+      if (mOktaverbLfoPhase[i] >= 1.0)
+        mOktaverbLfoPhase[i] -= 1.0;
+      const double mod = std::sin(kTwoPI * mOktaverbLfoPhase[i]) * sm.modulationDepth;
       double readPos = static_cast<double>(mHallIndices[i]) - static_cast<double>(mHallLengths[i]) - mod;
       const size_t bufSz = mHallDelays[i].size();
       while (readPos < 0.0) readPos += bufSz;
@@ -591,57 +680,94 @@ void Reverb::_ProcessOktaverb(DSP_SAMPLE** inputs, const size_t numChannels, con
       const double feedback = mHallLPState[i] * loopGain;
       readVals[i] = feedback;
 
-      // Pitched pre-delay: write the FDN read-tap into a per-line buffer; read it back N ms
-      // later for the pitch shifter input. This adds the "pitched bloom arrives slightly
-      // after the dry reverb onset" character.
-      auto& preBuf = mPitchedPreBuf[i];
-      const size_t preSz = preBuf.size();
-      const size_t preLen = std::min(pitchedPreDelayFrames, preSz - 2);
-      const size_t preReadIdx = (mPitchedPreIdx[i] + preSz - preLen) % preSz;
-      const double preDelayedFeedback = preBuf[preReadIdx];
-      preBuf[mPitchedPreIdx[i]] = feedback;
-      mPitchedPreIdx[i] = (mPitchedPreIdx[i] + 1) % preSz;
-
-      // Per-line detune: a tiny LFO on the input to the pitch shifter so the pitched bloom
-      // moves over time.
-      mPitchedDetunePhase[i] += detuneRateHz / mSampleRate;
-      if (mPitchedDetunePhase[i] >= 1.0) mPitchedDetunePhase[i] -= 1.0;
-      const double detune = std::sin(2.0 * kPI * mPitchedDetunePhase[i]) * centsToFrameFrac;
-
-      // Compute pitched components.
-      double pitched = 0.0;
-      const double pitchInput = preDelayedFeedback * (1.0 + detune);
-      if (sm.octGain > 0.0)
-        pitched += _PitchShiftTick(kVoiceOctUp, i, pitchInput, kOctaveUpRatio) * sm.octGain;
-      if (sm.fifthGain > 0.0)
-        pitched += _PitchShiftTick(kVoiceFifthUp, i, pitchInput, kFifthRatio) * sm.fifthGain;
-      if (sm.subOctGain > 0.0)
-        pitched += _PitchShiftTick(kVoiceSubOct, i, pitchInput, kOctaveDownRatio) * sm.subOctGain;
-      pitchedVals[i] = pitched;
+      parallelPitchVals[i] = 0.0;
+      if (parallelPitchGain > 0.0)
+      {
+        const double pitched = _PitchShiftTick(kVoiceSubFifthParallel, i, feedback, sm.parallelPitchRatio);
+        parallelPitchVals[i] = LPTick(mOktaverbPitchLPState[i], pitched, pitchLpCoef) * parallelPitchGain;
+      }
     }
+
+    const double absIn = std::abs(in);
+    LPTick(mBloomEnv, absIn, absIn > mBloomEnv ? bloomEnvAttackCoef : bloomEnvReleaseCoef);
+    const double bloomTarget = (mBloomEnv > 0.0001 || mBloomVCA > 0.0001) ? 1.0 : 0.0;
+    LPTick(mBloomVCA, bloomTarget, bloomTarget > mBloomVCA ? bloomAttackCoef : bloomReleaseCoef);
 
     for (int i = 0; i < kHallLines; i++)
     {
       double fb = 0.0;
       for (int j = 0; j < kHallLines; j++)
         fb += mixMat[i][j] * readVals[j];
-      double write = in * 0.5 + fb;
+      if (feedbackPitchGain > 0.0 || secondaryFeedbackPitchGain > 0.0)
+      {
+        // Decorrelated source mixes per voice so Halo's two pitches don't share spectra.
+        const double pitchSourcePrimary =
+          0.25 * (readVals[i] + readVals[(i + 3) % kHallLines] - readVals[(i + 5) % kHallLines]);
+        double pitched = 0.0;
+        if (feedbackPitchGain > 0.0)
+        {
+          // Primary voice: +12 (Shimmer / Halo) or -12 (legacy Dark, no longer reachable).
+          const double primary = _PitchShiftTick(kVoiceOctUpFeedback, i, pitchSourcePrimary, sm.feedbackPitchRatio);
+          pitched += primary * feedbackPitchGain;
+        }
+        if (secondaryFeedbackPitchGain > 0.0)
+        {
+          // Secondary voice (Halo): -12 with its own decorrelated tap mix to keep the
+          // dual character lush instead of phasey.
+          const double pitchSourceSecondary =
+            0.25 * (readVals[(i + 4) % kHallLines] - readVals[(i + 1) % kHallLines]
+                    + readVals[(i + 7) % kHallLines]);
+          const double secondary = _PitchShiftTick(
+            kVoiceOctDownFeedback, i, pitchSourceSecondary, sm.secondaryFeedbackPitchRatio);
+          pitched += secondary * secondaryFeedbackPitchGain;
+        }
+        // LP and HP are linear so summing voices first then filtering matches per-voice
+        // filtering; cheaper and shares state cleanly across modes.
+        pitched = LPTick(mOktaverbFeedbackPitchLPState[i], pitched, pitchLpCoef);
+        const double lowRumble = LPTick(mOktaverbFeedbackPitchHPState[i], pitched, pitchHpLpCoef);
+        pitched -= lowRumble;
+        fb += std::clamp(pitched, -0.65, 0.65);
+      }
+      const double tankIn = sm.bloom ? in : in * sm.inputGain;
+      double write = tankIn + fb;
       if (!std::isfinite(write)) { write = 0.0; Reset(); }
       mHallDelays[i][mHallIndices[i]] = std::clamp(write, -2.0, 2.0);
       mHallIndices[i] = (mHallIndices[i] + 1) % mHallDelays[i].size();
     }
 
-    const double hallOutL = (readVals[0] + readVals[2] - readVals[4] + readVals[6]) * 0.5;
-    const double hallOutR = (readVals[1] - readVals[3] + readVals[5] + readVals[7]) * 0.5;
-    const double pitchOutL = (pitchedVals[0] + pitchedVals[2] - pitchedVals[4] + pitchedVals[6]) * 0.5;
-    const double pitchOutR = (pitchedVals[1] - pitchedVals[3] + pitchedVals[5] + pitchedVals[7]) * 0.5;
-    const double outL = hallOutL + pitchOutL * shimmerOutput;
-    const double outR = hallOutR + pitchOutR * shimmerOutput;
+    const double center = (readVals[0] + readVals[1] + readVals[2] + readVals[3] +
+                           readVals[4] + readVals[5] + readVals[6] + readVals[7]) * 0.125;
+    const double hallTapL = (readVals[0] + readVals[2] - readVals[4] + readVals[6]) * 0.5;
+    const double hallTapR = (readVals[1] - readVals[3] + readVals[5] + readVals[7]) * 0.5;
+    const double hallOutL = center * (1.0 - sm.wetWidth) + hallTapL * sm.wetWidth;
+    const double hallOutR = center * (1.0 - sm.wetWidth) + hallTapR * sm.wetWidth;
+    const double pitchOutL = (parallelPitchVals[0] + parallelPitchVals[2] - parallelPitchVals[4] + parallelPitchVals[6]) * 0.5;
+    const double pitchOutR = (parallelPitchVals[1] - parallelPitchVals[3] + parallelPitchVals[5] + parallelPitchVals[7]) * 0.5;
+    const double bloomGain = sm.bloom ? mBloomVCA : 1.0;
+    const double outL = (hallOutL + pitchOutL) * bloomGain * sm.wetGain;
+    const double outR = (hallOutR + pitchOutR) * bloomGain * sm.wetGain;
 
+    // Safety stack scoped to the pitch-feedback Oktaverb sub-modes (Halo, Shimmer):
+    //   1. User's Mix knob internally scaled to 50 percent maximum, so the wet
+    //      contribution can never sum to more than half-level on top of dry.
+    //   2. tanh on the wet bus to keep wet-gain / FDN / pitch-feedback buildup
+    //      bounded below +-1.0. tanh is identity for small x so quiet tails are
+    //      unaffected; it only kicks in when the wet would otherwise have railed.
+    //   3. Final per-channel tanh on the dry+wet sum to defend against pitch
+    //      feedback runaway escaping the wet-bus stage.
+    // Bloom bypasses the saturators entirely (its swell character cannot tolerate
+    // tanh compression) but does cap Mix at 65 percent. That's the highest setting
+    // that still keeps the user's preferred swell character while preventing the
+    // dry+wet sum from clipping when the bloom envelope is fully open at long Decay.
+    // Hall and Plate are untouched and use their original additive Mix in their
+    // respective process functions.
+    const double cappedMix = sm.bloom ? (mMix * 0.65) : (mMix * 0.5);
     for (size_t c = 0; c < numChannels; c++)
     {
-      const double wet = (c == 0) ? outL : outR;
-      double final_ = inputs[c][s] + wet * mMix;
+      const double rawWet = (c == 0) ? outL : outR;
+      const double wet = sm.bloom ? rawWet : SoftSaturate(rawWet);
+      double mixed = inputs[c][s] + wet * cappedMix;
+      double final_ = sm.bloom ? mixed : SoftSaturate(mixed);
       if (std::isnan(final_) || std::isinf(final_)) { final_ = 0.0; Reset(); }
       mOutputs[c][s] = static_cast<DSP_SAMPLE>(final_);
     }

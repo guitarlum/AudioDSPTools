@@ -3,8 +3,8 @@
 //  VoLum - Hall (FDN), Plate (Dattorro), Oktaverb
 //
 //  Effect staging: Hall uses the good Cathedral-ish recipe under the single Hall label,
-//  Plate is the original Dattorro plate, and Oktaverb exposes Oct / Oct+5th / Oct+Sub
-//  sub-modes with pitched pre-delay and per-line detune motion.
+//  Plate is the original Dattorro plate, and Oktaverb exposes Dark / Shimmer / Bloom
+//  sub-modes with pitch-in-feedback and bloom voicing.
 //
 
 #pragma once
@@ -36,7 +36,7 @@ public:
   void SetParams(double mix, double decay, double tone, double preDelayMs, double shimmer, int mode, double sampleRate);
 
   // Staging API.
-  // - subMode (0..2): Oktaverb only: Oct / Oct+5th / Oct+Sub.
+  // - subMode (0..2): Oktaverb only: Dark / Shimmer / Bloom.
   //                   Ignored by Hall and Plate.
   void SetParams(double mix, double decay, double tone, double preDelayMs, double shimmer, int mode, double sampleRate,
                  int subMode);
@@ -59,9 +59,9 @@ private:
   void _SetPreDelayLength(double preDelayMs);
   double _ReadWritePreDelay(double input);
   // Generic grain-based pitch shifter; ratio > 1 = pitch up, ratio < 1 = pitch down.
-  // 'voice' indexes a separate set of grain buffers so shifters with different ratios don't
-  // share state. We have kHallLines voices for octave-up, fifth and sub-octave each.
-  enum PitchVoice { kVoiceOctUp = 0, kVoiceFifthUp = 1, kVoiceSubOct = 2, kNumPitchVoices = 3 };
+  // 'voice' indexes separate grain buffers so feedback octave-up, feedback octave-down, and
+  // parallel sub-fifth paths never share state.
+  enum PitchVoice { kVoiceOctUpFeedback = 0, kVoiceOctDownFeedback = 1, kVoiceSubFifthParallel = 2, kNumPitchVoices = 3 };
   double _PitchShiftTick(int voice, int line, double input, double ratio);
 
   // Map raw mTone (0..10) to an LP cutoff for the active mode. Curve compresses the dark
@@ -75,7 +75,7 @@ private:
   double mPreDelayMs = 20.0;
   double mShimmer = 0.5;
   int mMode = kModeHall;
-  int mSubMode = 0; // Oktaverb only: 0=Oct, 1=Oct+5th, 2=Oct+Sub.
+  int mSubMode = 0; // Oktaverb only: 0=Dark, 1=Shimmer, 2=Bloom.
 
   // Hall (8-line FDN + Hadamard)
   static const int kHallLines = 8;
@@ -100,6 +100,12 @@ private:
 
   // Per-line detune LFO for pitched line (Oktaverb motion).
   std::vector<double> mPitchedDetunePhase;
+  std::vector<double> mOktaverbLfoPhase;
+  std::vector<double> mOktaverbPitchLPState;
+  std::vector<double> mOktaverbFeedbackPitchLPState;
+  std::vector<double> mOktaverbFeedbackPitchHPState;
+  double mBloomEnv = 0.0;
+  double mBloomVCA = 0.0;
 
   // Plate (Dattorro)
   static const int kInputAPs = 4;
