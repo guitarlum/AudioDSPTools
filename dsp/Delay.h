@@ -39,7 +39,7 @@ public:
   // - tone (0..1): per-mode tilt EQ; 0.5 = flat.
   // - age (0..1): per-mode character control (Digital crusher/noise, Analog BBD darkness/chorus depth,
   //   Reverse fade-shape softness).
-  // - pingPong: stereo cross-feedback toggle. Ignored by Reverse.
+  // - pingPong: stereo cross-feedback toggle (R-line seed + opposite tap feedback). Ignored by Reverse.
   void SetParams(double timeMs, double feedback, double mix, int mode, double sampleRate,
                  double tone, double age, bool pingPong);
 

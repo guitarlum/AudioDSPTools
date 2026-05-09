@@ -63,6 +63,9 @@ void Delay::SetParams(double timeMs, double feedback, double mix, int mode, doub
 void Delay::SetParams(double timeMs, double feedback, double mix, int mode, double sampleRate, double tone, double age,
                       bool pingPong)
 {
+  const int prevMode = mMode;
+  const bool prevPingPong = mPingPong;
+
   if (mSampleRate != sampleRate)
   {
     mSampleRate = sampleRate;
@@ -79,6 +82,9 @@ void Delay::SetParams(double timeMs, double feedback, double mix, int mode, doub
   mTone = std::clamp(tone, 0.0, 1.0);
   mAge = std::clamp(age, 0.0, 1.0);
   mPingPong = pingPong && mMode != kModeReverse;
+
+  if (prevMode != mMode || prevPingPong != mPingPong)
+    Reset();
 
   mTargetDelayFrames = (mTimeMs / 1000.0) * mSampleRate;
   if (mCurrentDelayFrames == 0.0)
@@ -252,12 +258,20 @@ DSP_SAMPLE** Delay::_ProcessDigital(DSP_SAMPLE** inputs, const size_t numChannel
       }
       mOutputs[c][s] = static_cast<DSP_SAMPLE>(finalSample);
 
-      // Ping-pong: feed the OPPOSITE channel's read tap into our write tap so repeats
-      // alternate L<->R while decaying equally. The dry input is also cross-seeded so
-      // a left-only impulse produces its first delayed repeat on the right.
-      const double feedbackSrc = mPingPong ? readOther : readC;
-      const double writeInput = (mPingPong && numChannels > 1 && c < 2) ? static_cast<double>(inputs[1 - c][s])
-                                                                         : inputSample;
+      // Ping-pong: opposite-channel read into feedback; seed right delay line only so L=R mono
+      // still produces R-first alternating repeats (cross-feed fills left on later taps).
+      double feedbackSrc;
+      double writeInput;
+      if (mPingPong && numChannels > 1 && c < 2)
+      {
+        feedbackSrc = readOther;
+        writeInput = (c == 1) ? static_cast<double>(inputs[0][s]) : 0.0;
+      }
+      else
+      {
+        feedbackSrc = readC;
+        writeInput = inputSample;
+      }
       mBuffer[c][mWriteIndex] = writeInput + feedbackSrc * mFeedback;
     }
 
@@ -335,13 +349,22 @@ DSP_SAMPLE** Delay::_ProcessAnalog(DSP_SAMPLE** inputs, const size_t numChannels
       mOutputs[c][s] = static_cast<DSP_SAMPLE>(finalSample);
 
       // Soft saturation in feedback path; intensity rises with feedback.
-      const double feedbackSrc = (mPingPong && numChannels > 1 && c < 2) ? readBase[1 - c] : readCBase;
+      double feedbackSrcBase;
+      double writeInput;
+      if (mPingPong && numChannels > 1 && c < 2)
+      {
+        feedbackSrcBase = readBase[1 - c];
+        writeInput = (c == 1) ? static_cast<double>(inputs[0][s]) : 0.0;
+      }
+      else
+      {
+        feedbackSrcBase = readCBase;
+        writeInput = inputSample;
+      }
       const double drive = 1.0 + std::max(0.0, mFeedback - 0.5) * 1.5;
-      const double saturated = SoftClipAsym(feedbackSrc * mFeedback, drive);
+      const double saturated = SoftClipAsym(feedbackSrcBase * mFeedback, drive);
       // Compander compression on write (gentle 2:1 around envelope).
       const double compressGain = 1.0 / (1.0 + mCompandEnv * 0.4);
-      const double writeInput = (mPingPong && numChannels > 1 && c < 2) ? static_cast<double>(inputs[1 - c][s])
-                                                                         : inputSample;
       mBuffer[c][mWriteIndex] = (writeInput + saturated) * compressGain;
     }
 
