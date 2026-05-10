@@ -70,7 +70,7 @@ void Delay::SetParams(double timeMs, double feedback, double mix, int mode, doub
   {
     mSampleRate = sampleRate;
     _PrepareDelayLines(mBuffer.size());
-    _PrepareReverseBuffers(mReverseCaptureBuffer.size());
+    _PrepareReverseBuffers(mReverseRing.size());
     mWriteIndex = 0;
     _ResetReverseState();
   }
@@ -83,20 +83,21 @@ void Delay::SetParams(double timeMs, double feedback, double mix, int mode, doub
   mAge = std::clamp(age, 0.0, 1.0);
   mPingPong = pingPong && mMode != kModeReverse;
 
-  if (prevMode != mMode || prevPingPong != mPingPong)
-    Reset();
-
   mTargetDelayFrames = (mTimeMs / 1000.0) * mSampleRate;
   if (mCurrentDelayFrames == 0.0)
     mCurrentDelayFrames = mTargetDelayFrames;
 
-  const size_t reverseSegmentFrames = std::clamp<size_t>(
-    static_cast<size_t>(std::round(mTargetDelayFrames)), 1, _GetMaxFrames());
-  if (reverseSegmentFrames != mReverseSegmentFrames)
-  {
-    mReverseSegmentFrames = reverseSegmentFrames;
-    _ResetReverseState();
-  }
+  // Overlap-add reverse: in-flight voices keep their original length when this
+  // changes, so updating segment frames here is glitch-free (no Reset needed).
+  // Cap to half the ring so two voices can coexist without wrap-around aliasing
+  // into the in-flight voice's snapshot. Must be set BEFORE Reset() below so the
+  // post-reset launch countdown reflects the new slice length.
+  mReverseSegmentFrames = std::clamp<size_t>(
+    static_cast<size_t>(std::round(mTargetDelayFrames)), 2,
+    std::max<size_t>(2, _GetMaxFrames() / 2));
+
+  if (prevMode != mMode || prevPingPong != mPingPong)
+    Reset();
 }
 
 void Delay::Reset()
@@ -137,29 +138,23 @@ void Delay::_PrepareDelayLines(const size_t numChannels)
 
 void Delay::_PrepareReverseBuffers(const size_t numChannels)
 {
-  const size_t maxFrames = _GetMaxFrames();
+  const size_t ringSize = _GetMaxFrames();
   bool resized = false;
 
-  if (mReverseCaptureBuffer.size() != numChannels)
+  if (mReverseRing.size() != numChannels)
   {
-    mReverseCaptureBuffer.resize(numChannels);
-    mReversePlaybackBuffer.resize(numChannels);
+    mReverseRing.resize(numChannels);
     resized = true;
   }
-
   for (size_t c = 0; c < numChannels; ++c)
   {
-    if (mReverseCaptureBuffer[c].size() != maxFrames)
+    if (mReverseRing[c].size() != ringSize)
     {
-      mReverseCaptureBuffer[c].assign(maxFrames, 0.0);
-      resized = true;
-    }
-    if (mReversePlaybackBuffer[c].size() != maxFrames)
-    {
-      mReversePlaybackBuffer[c].assign(maxFrames, 0.0);
+      mReverseRing[c].assign(ringSize, 0.0);
       resized = true;
     }
   }
+  mReverseRingSize = ringSize;
 
   if (resized)
     _ResetReverseState();
@@ -167,12 +162,14 @@ void Delay::_PrepareReverseBuffers(const size_t numChannels)
 
 void Delay::_ResetReverseState()
 {
-  for (auto& buf : mReverseCaptureBuffer)
+  for (auto& buf : mReverseRing)
     std::fill(buf.begin(), buf.end(), 0.0);
-  for (auto& buf : mReversePlaybackBuffer)
-    std::fill(buf.begin(), buf.end(), 0.0);
-  mReverseIndex = 0;
-  mReversePlaybackReady = false;
+  mReverseWritePos = 0;
+  // First voice can launch only after one full slice has been captured; otherwise
+  // it would read silence (or stale ring contents) and produce a "tick" at start.
+  mReverseFramesUntilLaunch = std::max<size_t>(1, mReverseSegmentFrames);
+  for (auto& v : mReverseVoices)
+    v = ReverseVoice{};
 }
 
 double Delay::_ApplyToneTilt(size_t channel, double sample, double tone, double cutoffHz)
@@ -378,36 +375,65 @@ DSP_SAMPLE** Delay::_ProcessReverse(DSP_SAMPLE** inputs, const size_t numChannel
 {
   _PrepareReverseBuffers(numChannels);
 
-  const size_t segmentFrames = std::clamp(mReverseSegmentFrames, static_cast<size_t>(1), _GetMaxFrames());
+  const size_t ringSize = mReverseRingSize;
+  if (ringSize == 0 || numChannels == 0)
+    return _GetPointers();
+
+  const size_t segmentFrames = std::clamp<size_t>(mReverseSegmentFrames, 2, ringSize / 2);
 
   for (size_t s = 0; s < numFrames; s++)
   {
-    if (mReverseIndex >= segmentFrames)
+    // 1) Launch a new voice when the stagger countdown expires. Two voices alternate;
+    //    a fresh launch picks the inactive slot (or steals the older one). The
+    //    countdown uses the *current* segmentFrames, so time-knob changes fade in
+    //    cleanly on the next launch without disturbing in-flight voices.
+    if (mReverseFramesUntilLaunch == 0)
     {
-      std::swap(mReverseCaptureBuffer, mReversePlaybackBuffer);
-      for (auto& buf : mReverseCaptureBuffer)
-        std::fill_n(buf.begin(), segmentFrames, 0.0);
-      mReverseIndex = 0;
-      mReversePlaybackReady = true;
+      int slot = -1;
+      for (int v = 0; v < 2; ++v)
+      {
+        if (!mReverseVoices[v].active)
+        {
+          slot = v;
+          break;
+        }
+      }
+      if (slot < 0)
+        slot = (mReverseVoices[0].index >= mReverseVoices[1].index) ? 0 : 1;
+
+      ReverseVoice& voice = mReverseVoices[slot];
+      voice.active = true;
+      voice.index = 0;
+      voice.length = segmentFrames;
+      voice.startReadPos = (mReverseWritePos + ringSize - 1) % ringSize;
+
+      mReverseFramesUntilLaunch = std::max<size_t>(1, segmentFrames / 2);
     }
 
-    const size_t playbackIndex = segmentFrames - 1 - mReverseIndex;
-    const double fadeGain = _GetReverseFadeGain(mReverseIndex, segmentFrames);
-
+    // 2) Sum two windowed reversed taps -> wet; output = dry + wet * Mix; capture
+    //    feeds back the wet sum (matches forward modes' use of post-tilt feedback).
     for (size_t c = 0; c < numChannels; c++)
     {
       const double inputSample = inputs[c][s];
-      double reversedSample = mReversePlaybackReady ? mReversePlaybackBuffer[c][playbackIndex] * fadeGain : 0.0;
-      // Tone tilt on wet only.
-      reversedSample = _ApplyToneTilt(c, reversedSample, mTone, 3500.0);
 
-      // Reverse blend matches Digital / Analog: `dry + wet * mMix` (additive). Pre-fix
-      // Reverse used a linear crossfade `dry*(1-mMix) + wet*mMix`, which attenuated dry
-      // whenever Mix > 0 while forward modes did not — directly responsible for the
-      // perceived volume drop when engaging Reverse at the same Mix value as Digital /
-      // Analog. Aligning the law removes the drop without altering the reverse algorithm.
-      double finalSample = inputSample + reversedSample * mMix;
+      double wet = 0.0;
+      for (int v = 0; v < 2; ++v)
+      {
+        const ReverseVoice& voice = mReverseVoices[v];
+        if (!voice.active)
+          continue;
+        const size_t readPos = (voice.startReadPos + ringSize - voice.index) % ringSize;
+        const double sample = mReverseRing[c][readPos];
+        const double gain = _GetReverseWindowGain(voice.index, voice.length);
+        wet += sample * gain;
+      }
 
+      // Tone tilt on wet only (matches Digital / Analog convention).
+      wet = _ApplyToneTilt(c, wet, mTone, 3500.0);
+
+      // Additive blend, identical to Digital / Analog. Pinned by
+      // `Delay: Reverse and Digital RMS match within 0.5 dB at same Mix`.
+      double finalSample = inputSample + wet * mMix;
       if (!std::isfinite(finalSample))
       {
         finalSample = 0.0;
@@ -415,33 +441,42 @@ DSP_SAMPLE** Delay::_ProcessReverse(DSP_SAMPLE** inputs, const size_t numChannel
       }
 
       mOutputs[c][s] = static_cast<DSP_SAMPLE>(finalSample);
-      mReverseCaptureBuffer[c][mReverseIndex] = inputSample + reversedSample * mFeedback;
+      mReverseRing[c][mReverseWritePos] = inputSample + wet * mFeedback;
     }
 
-    ++mReverseIndex;
+    // 3) Advance per-voice playback indices, write pointer, and stagger countdown.
+    for (auto& voice : mReverseVoices)
+    {
+      if (!voice.active)
+        continue;
+      ++voice.index;
+      if (voice.index >= voice.length)
+        voice.active = false;
+    }
+    mReverseWritePos = (mReverseWritePos + 1) % ringSize;
+    if (mReverseFramesUntilLaunch > 0)
+      --mReverseFramesUntilLaunch;
   }
 
   return _GetPointers();
 }
 
-double Delay::_GetReverseFadeGain(size_t index, size_t segmentFrames) const
+double Delay::_GetReverseWindowGain(size_t index, size_t length) const
 {
-  const size_t fadeFrames = std::min<size_t>(64, segmentFrames / 2);
-  if (fadeFrames == 0 || segmentFrames < 2)
-    return 1.0;
+  if (length < 2)
+    return 0.0;
+  if (index >= length)
+    return 0.0;
 
-  const size_t endDistance = segmentFrames - 1 - index;
-  const size_t fadeDistance = std::min(index, endDistance);
-  const double edgeFade = fadeDistance >= fadeFrames
-                            ? 1.0
-                            : static_cast<double>(fadeDistance) / static_cast<double>(fadeFrames);
-
-  // Bloom keeps the old reverse-delay core at 0 and moves toward a softer whole-slice
-  // sin^2 swell at 1, instead of replacing the old sound with a permanent triangle fade.
-  const double t = static_cast<double>(index) / static_cast<double>(segmentFrames - 1);
-  const double smoothBloom = std::sin(M_PI * t);
-  const double sinSq = smoothBloom * smoothBloom;
-  return edgeFade * (1.0 - mAge) + sinSq * mAge;
+  const double t = static_cast<double>(index) / static_cast<double>(length - 1);
+  // Triangle (Age=0) and sin^2 (Age=1) both satisfy w(t) + w(t+0.5) = 1 at 50%
+  // overlap, so the wet sum is constant regardless of Age. Triangle has a sharper
+  // peak (more transient impact in the middle of each slice); sin^2 is smoother
+  // ("Bloom").
+  const double tri = (t < 0.5) ? 2.0 * t : 2.0 * (1.0 - t);
+  const double sn = std::sin(M_PI * t);
+  const double sinSq = sn * sn;
+  return (1.0 - mAge) * tri + mAge * sinSq;
 }
 
 size_t Delay::_GetMaxFrames() const

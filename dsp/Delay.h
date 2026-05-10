@@ -56,7 +56,11 @@ private:
   DSP_SAMPLE** _ProcessDigital(DSP_SAMPLE** inputs, const size_t numChannels, const size_t numFrames);
   DSP_SAMPLE** _ProcessAnalog(DSP_SAMPLE** inputs, const size_t numChannels, const size_t numFrames);
   DSP_SAMPLE** _ProcessReverse(DSP_SAMPLE** inputs, const size_t numChannels, const size_t numFrames);
-  double _GetReverseFadeGain(size_t index, size_t segmentFrames) const;
+  // Window gain for one playback voice. t = index/(length-1) in [0,1]. Blend of
+  // triangular (Age=0) and sin^2 (Age=1) windows; both unit-sum at 50% overlap, so
+  // two voices launched length/2 apart produce a constant-gain wet bus (no slice
+  // boundary dip).
+  double _GetReverseWindowGain(size_t index, size_t length) const;
 
   // Per-mode tone-tilt one-pole filter applied on the wet bus.
   // Tone in [0,1]: 0=darker, 0.5=flat, 1=brighter. Returns filtered sample.
@@ -81,12 +85,25 @@ private:
   std::vector<std::vector<double>> mBuffer;
   size_t mWriteIndex = 0;
 
-  // Reverse mode uses one buffer to capture the next slice while another plays back the previous slice backwards.
-  std::vector<std::vector<double>> mReverseCaptureBuffer;
-  std::vector<std::vector<double>> mReversePlaybackBuffer;
+  // Reverse mode: continuous capture ring + two overlap-add playback voices.
+  // Each voice grabs a snapshot of the most-recent segmentFrames samples at launch
+  // and plays them backwards; voices are staggered by length/2 so their windowed
+  // sum is ~constant (no slice-boundary amplitude dip). In-flight voices keep
+  // their original length when the time knob changes, so segment-length updates
+  // do not glitch the wet bus.
+  struct ReverseVoice
+  {
+    bool active = false;
+    size_t index = 0;       // 0..length-1, position within reversed playback
+    size_t length = 0;      // segmentFrames captured at launch
+    size_t startReadPos = 0;// ring index of the most-recent sample at launch
+  };
+  std::vector<std::vector<double>> mReverseRing; // per-channel capture ring
+  size_t mReverseRingSize = 0;
+  size_t mReverseWritePos = 0;
   size_t mReverseSegmentFrames = 1;
-  size_t mReverseIndex = 0;
-  bool mReversePlaybackReady = false;
+  size_t mReverseFramesUntilLaunch = 1;
+  ReverseVoice mReverseVoices[2];
 
   // Per-channel one-pole lowpass state for tone tilt + per-repeat HF damping.
   std::vector<double> mToneState;
