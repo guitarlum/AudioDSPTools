@@ -401,7 +401,12 @@ DSP_SAMPLE** Delay::_ProcessReverse(DSP_SAMPLE** inputs, const size_t numChannel
       // Tone tilt on wet only.
       reversedSample = _ApplyToneTilt(c, reversedSample, mTone, 3500.0);
 
-      double finalSample = inputSample * (1.0 - mMix) + reversedSample * mMix;
+      // Reverse blend matches Digital / Analog: `dry + wet * mMix` (additive). Pre-fix
+      // Reverse used a linear crossfade `dry*(1-mMix) + wet*mMix`, which attenuated dry
+      // whenever Mix > 0 while forward modes did not — directly responsible for the
+      // perceived volume drop when engaging Reverse at the same Mix value as Digital /
+      // Analog. Aligning the law removes the drop without altering the reverse algorithm.
+      double finalSample = inputSample + reversedSample * mMix;
 
       if (!std::isfinite(finalSample))
       {

@@ -590,10 +590,20 @@ void Reverb::_ProcessHall(DSP_SAMPLE** inputs, const size_t numChannels, const s
     const double outL = (readVals[0] + readVals[2] - readVals[4] + readVals[6]) * 0.5;
     const double outR = (readVals[1] - readVals[3] + readVals[5] + readVals[7]) * 0.5;
 
+    // Equal-power crossfade. Pre-equal-power VoLum used `dry + wet*mMix` (additive),
+    // which kept dry at unity at every Mix value and left reverb feeling "too quiet"
+    // at musically normal settings. Equal-power matches Strymon BigSky / Eventide /
+    // Neunaber convention: wet rises with sin(angle), dry falls with cos(angle), total
+    // power preserved. kReverbWetTrim trims Hall/Plate up so they match Oktaverb
+    // perceived loudness at Mix=0.5.
+    const double angle = mMix * (kPI * 0.5);
+    const double dryCoef = std::cos(angle);
+    const double wetCoef = std::sin(angle) * kReverbWetTrim;
+
     for (size_t c = 0; c < numChannels; c++)
     {
       const double wet = (c == 0) ? outL : outR;
-      double final_ = inputs[c][s] + wet * mMix;
+      double final_ = inputs[c][s] * dryCoef + wet * wetCoef;
       if (std::isnan(final_) || std::isinf(final_)) { final_ = 0.0; Reset(); }
       mOutputs[c][s] = static_cast<DSP_SAMPLE>(final_);
     }
@@ -761,12 +771,21 @@ void Reverb::_ProcessOktaverb(DSP_SAMPLE** inputs, const size_t numChannels, con
     // dry+wet sum from clipping when the bloom envelope is fully open at long Decay.
     // Hall and Plate are untouched and use their original additive Mix in their
     // respective process functions.
-    const double cappedMix = sm.bloom ? (mMix * 0.65) : (mMix * 0.5);
+    // Equal-power crossfade on the user-Mix angle. Halo / Shimmer keep the 50% cap and
+    // Bloom keeps the 65% cap; those caps now bound the angle (so user mMix=1 maps to
+    // angle = pi/4 for non-Bloom, pi*0.65/2 for Bloom) instead of bounding the wet
+    // coefficient. Oktaverb wet bus already bakes sm.wetGain into the wet (1.40 / 1.55),
+    // so no additional kReverbWetTrim is applied here. tanh saturators on wet (Halo /
+    // Shimmer) and on the dry+wet sum are preserved.
+    const double cap = sm.bloom ? 0.65 : 0.5;
+    const double angle = mMix * cap * (kPI * 0.5);
+    const double dryCoef = std::cos(angle);
+    const double wetCoef = std::sin(angle);
     for (size_t c = 0; c < numChannels; c++)
     {
       const double rawWet = (c == 0) ? outL : outR;
       const double wet = sm.bloom ? rawWet : SoftSaturate(rawWet);
-      double mixed = inputs[c][s] + wet * cappedMix;
+      double mixed = inputs[c][s] * dryCoef + wet * wetCoef;
       double final_ = sm.bloom ? mixed : SoftSaturate(mixed);
       if (std::isnan(final_) || std::isinf(final_)) { final_ = 0.0; Reset(); }
       mOutputs[c][s] = static_cast<DSP_SAMPLE>(final_);
@@ -839,10 +858,15 @@ void Reverb::_ProcessPlate(DSP_SAMPLE** inputs, const size_t numChannels, const 
     const double outL = mTank[0].lastOut * 0.6 + mTank[1].lastOut * 0.4;
     const double outR = mTank[1].lastOut * 0.6 + mTank[0].lastOut * 0.4;
 
+    // Equal-power crossfade (see Hall comment for rationale).
+    const double angle = mMix * (kPI * 0.5);
+    const double dryCoef = std::cos(angle);
+    const double wetCoef = std::sin(angle) * kReverbWetTrim;
+
     for (size_t c = 0; c < numChannels; c++)
     {
       const double wet = (c == 0) ? outL : outR;
-      double final_ = inputs[c][s] + wet * mMix;
+      double final_ = inputs[c][s] * dryCoef + wet * wetCoef;
       if (std::isnan(final_) || std::isinf(final_)) { final_ = 0.0; Reset(); }
       mOutputs[c][s] = static_cast<DSP_SAMPLE>(final_);
     }
