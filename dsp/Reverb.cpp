@@ -119,9 +119,8 @@ OktaverbSubModeChar GetOktaverbSubMode(int sub)
     // voice for body lift, wet boosted so Mix at ~30 percent reads over the dry amp signal.
     case 1: return {kOctaveUpRatio, 0.42, 1.0, 0.0, kOctaveUpRatio, 0.32,
                     0.75, 1200.0, 5000.0, 12000.0, 14.0, 1.10, 1.55, false};
-    // Bloom: no pitch shifting, swell-driven envelope. Skips the safety saturators in
-    // _ProcessOktaverb (it has no pitch-feedback runaway pathology) so the wetGain is
-    // tuned conservatively here to stay well clear of clipping under realistic input.
+    // Bloom: no pitch shifting, swell-driven envelope. It shares the same final output
+    // safety as Halo/Shimmer so its default swell cannot clip when dry and wet align.
     case 2: return {1.0, 0.0, 1.0, 0.0, 1.0, 0.0,
                     0.50, 1200.0, 4700.0, 9500.0, 9.0, 1.25, 1.40, true};
     case 0:
@@ -757,27 +756,21 @@ void Reverb::_ProcessOktaverb(DSP_SAMPLE** inputs, const size_t numChannels, con
     const double outL = (hallOutL + pitchOutL) * bloomGain * sm.wetGain;
     const double outR = (hallOutR + pitchOutR) * bloomGain * sm.wetGain;
 
-    // Safety stack scoped to the pitch-feedback Oktaverb sub-modes (Halo, Shimmer):
+    // Safety stack scoped to Oktaverb:
     //   1. User's Mix knob internally scaled to 50 percent maximum, so the wet
     //      contribution can never sum to more than half-level on top of dry.
     //   2. tanh on the wet bus to keep wet-gain / FDN / pitch-feedback buildup
-    //      bounded below +-1.0. tanh is identity for small x so quiet tails are
-    //      unaffected; it only kicks in when the wet would otherwise have railed.
-    //   3. Final per-channel tanh on the dry+wet sum to defend against pitch
-    //      feedback runaway escaping the wet-bus stage.
-    // Bloom bypasses the saturators entirely (its swell character cannot tolerate
-    // tanh compression) but does cap Mix at 65 percent. That's the highest setting
-    // that still keeps the user's preferred swell character while preventing the
-    // dry+wet sum from clipping when the bloom envelope is fully open at long Decay.
+    //      bounded below +-1.0. Bloom skips this wet-bus tanh so the swell remains open.
+    //   3. Final per-channel tanh on the dry+wet sum to prevent clipping. Bloom uses
+    //      this same final shoulder when Mix is above zero; Mix=0 remains dry-pass.
     // Hall and Plate are untouched and use their original additive Mix in their
     // respective process functions.
-    // Equal-power crossfade on the user-Mix angle. Halo / Shimmer keep the 50% cap and
-    // Bloom keeps the 65% cap; those caps now bound the angle (so user mMix=1 maps to
-    // angle = pi/4 for non-Bloom, pi*0.65/2 for Bloom) instead of bounding the wet
-    // coefficient. Oktaverb wet bus already bakes sm.wetGain into the wet (1.40 / 1.55),
+    // Equal-power crossfade on the user-Mix angle. The 50% cap bounds the angle so user
+    // mMix=1 maps to angle = pi/4 instead of bounding the wet coefficient. Oktaverb wet
+    // bus already bakes sm.wetGain into the wet (1.40 / 1.55),
     // so no additional kReverbWetTrim is applied here. tanh saturators on wet (Halo /
     // Shimmer) and on the dry+wet sum are preserved.
-    const double cap = sm.bloom ? 0.65 : 0.5;
+    const double cap = 0.5;
     const double angle = mMix * cap * (kPI * 0.5);
     const double dryCoef = std::cos(angle);
     const double wetCoef = std::sin(angle);
@@ -786,7 +779,7 @@ void Reverb::_ProcessOktaverb(DSP_SAMPLE** inputs, const size_t numChannels, con
       const double rawWet = (c == 0) ? outL : outR;
       const double wet = sm.bloom ? rawWet : SoftSaturate(rawWet);
       double mixed = inputs[c][s] * dryCoef + wet * wetCoef;
-      double final_ = sm.bloom ? mixed : SoftSaturate(mixed);
+      double final_ = (sm.bloom && mMix <= 0.0) ? mixed : SoftSaturate(mixed);
       if (std::isnan(final_) || std::isinf(final_)) { final_ = 0.0; Reset(); }
       mOutputs[c][s] = static_cast<DSP_SAMPLE>(final_);
     }

@@ -32,7 +32,7 @@ public:
   // wet busses have no internal wet-gain, so kReverbWetTrim trims them up so all three
   // reverb modes hit comparable perceived loudness at Mix=0.5. Oktaverb wet already
   // bakes sm.wetGain (1.40 / 1.55) into the wet bus, so it does NOT use this trim - its
-  // existing per-sub-mode caps (0.5 / 0.65) bound the user-mix angle instead.
+  // internal 50 percent cap bounds the user-mix angle instead.
   static constexpr double kReverbWetTrim = 1.55;
 
   Reverb();
