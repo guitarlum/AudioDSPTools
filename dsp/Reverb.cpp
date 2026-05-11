@@ -198,6 +198,8 @@ void Reverb::SetParams(double mix, double decay, double tone, double preDelayMs,
                        double sampleRate, int subMode)
 {
   const bool srChanged = (mSampleRate != sampleRate);
+  const int prevMode = mMode;
+  const int prevSubMode = mSubMode;
   // Keep the expanded pre-delay range for Oktaverb bloom.
   const double clampedPreDelayMs = std::clamp(preDelayMs, 0.0, 200.0);
   mSampleRate = sampleRate;
@@ -208,6 +210,23 @@ void Reverb::SetParams(double mix, double decay, double tone, double preDelayMs,
   mShimmer = std::clamp(shimmer, 0.0, 1.0);
   mMode = std::clamp(mode, 0, kNumModes - 1);
   mSubMode = std::clamp(subMode, 0, 2);
+
+  // ~10 Hz one-pole towards the new Mix target. Inaudible delay (~16 ms time
+  // constant) but kills the per-block stepping that DAW automation of the Mix
+  // knob would otherwise produce on the equal-power dry/wet crossfade.
+  if (mSampleRate > 0.0)
+  {
+    constexpr double kSmoothHz = 10.0;
+    mMixSmoothCoef = 1.0 - std::exp(-2.0 * kPI * kSmoothHz / mSampleRate);
+  }
+  // On the very first SetParams from a fresh Reverb (or after an SR change that
+  // already invalidated the algorithm allocations), snap the smoother to the new
+  // target so the first block runs at the intended dry/wet mix instead of
+  // ramping up from the constructor default.
+  if (srChanged)
+  {
+    mMixSmoothed = mMix;
+  }
 
   if (srChanged)
   {
@@ -230,6 +249,15 @@ void Reverb::SetParams(double mix, double decay, double tone, double preDelayMs,
     if (!mHallAllocated) _AllocateHall();
     if (!mOktaverbAllocated) _AllocateOktaverb();
   }
+
+  // Hall (FDN), Plate (Dattorro), and Oktaverb share some allocations (kHallLines /
+  // pitch lines) but each algorithm writes into its own indices. Switching between
+  // modes without clearing state lets the previous algorithm's energy leak through
+  // the new one for one decay tail length. Match Delay::SetParams which clears on
+  // mode toggle, and also reset when the Oktaverb sub-mode (Halo / Shimmer / Bloom)
+  // changes because each sub-mode owns distinct feedback paths.
+  if (prevMode != mMode || (mMode == kModeOktaverb && prevSubMode != mSubMode))
+    Reset();
 }
 
 void Reverb::_AllocatePreDelay()
@@ -380,6 +408,7 @@ void Reverb::Reset()
   mInputLPState = 0.0;
   mHallLfoPhase = 0.0;
   mPlateLfoPhase = 0.0;
+  mMixSmoothed = mMix;
 }
 
 void Reverb::_PrepareBuffers(const size_t numChannels, const size_t numFrames)
@@ -595,7 +624,8 @@ void Reverb::_ProcessHall(DSP_SAMPLE** inputs, const size_t numChannels, const s
     // Neunaber convention: wet rises with sin(angle), dry falls with cos(angle), total
     // power preserved. kReverbWetTrim trims Hall/Plate up so they match Oktaverb
     // perceived loudness at Mix=0.5.
-    const double angle = mMix * (kPI * 0.5);
+    mMixSmoothed += (mMix - mMixSmoothed) * mMixSmoothCoef;
+    const double angle = mMixSmoothed * (kPI * 0.5);
     const double dryCoef = std::cos(angle);
     const double wetCoef = std::sin(angle) * kReverbWetTrim;
 
@@ -771,7 +801,8 @@ void Reverb::_ProcessOktaverb(DSP_SAMPLE** inputs, const size_t numChannels, con
     // so no additional kReverbWetTrim is applied here. tanh saturators on wet (Halo /
     // Shimmer) and on the dry+wet sum are preserved.
     const double cap = 0.5;
-    const double angle = mMix * cap * (kPI * 0.5);
+    mMixSmoothed += (mMix - mMixSmoothed) * mMixSmoothCoef;
+    const double angle = mMixSmoothed * cap * (kPI * 0.5);
     const double dryCoef = std::cos(angle);
     const double wetCoef = std::sin(angle);
     for (size_t c = 0; c < numChannels; c++)
@@ -852,7 +883,8 @@ void Reverb::_ProcessPlate(DSP_SAMPLE** inputs, const size_t numChannels, const 
     const double outR = mTank[1].lastOut * 0.6 + mTank[0].lastOut * 0.4;
 
     // Equal-power crossfade (see Hall comment for rationale).
-    const double angle = mMix * (kPI * 0.5);
+    mMixSmoothed += (mMix - mMixSmoothed) * mMixSmoothCoef;
+    const double angle = mMixSmoothed * (kPI * 0.5);
     const double dryCoef = std::cos(angle);
     const double wetCoef = std::sin(angle) * kReverbWetTrim;
 

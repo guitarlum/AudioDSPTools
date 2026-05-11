@@ -77,6 +77,12 @@ private:
 
   double mSampleRate = 0.0;
   double mMix = 0.3;
+  // One-pole smoothed Mix used by the final dry/wet crossfade so automating the
+  // Mix knob (in a DAW or via a long preset crossfade) does not zipper at block
+  // boundaries. SetParams updates mMix (target); the process loops advance
+  // mMixSmoothed toward it per sample. Reset snaps them together.
+  double mMixSmoothed = 0.3;
+  double mMixSmoothCoef = 0.0;
   double mDecay = 3.0;
   double mTone = 4.5;
   double mPreDelayMs = 20.0;
