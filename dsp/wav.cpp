@@ -192,12 +192,13 @@ dsp::wav::LoadReturnCode ReadFmtChunk(std::ifstream& wavFile, WaveFileData& wfd,
   }
 
   wfd.fmtChunk.numChannels = ReadShort(wavFile);
-  // HACK
-  // Note for future: for multi-channel files, samples are laid out with channel in the inner loop.
-  if (wfd.fmtChunk.numChannels != 1)
+  // VoLum: accept multi-channel WAVs (commercial IRs are frequently stereo) and
+  // downmix to mono in ReadDataChunk. Samples are laid out frame-major with the
+  // channel in the inner loop. Upstream rejected anything but mono here.
+  if (wfd.fmtChunk.numChannels < 1)
   {
-    std::cerr << "Require mono (using for IR loading)" << std::endl;
-    return dsp::wav::LoadReturnCode::ERROR_NOT_MONO;
+    std::cerr << "Invalid channel count " << wfd.fmtChunk.numChannels << std::endl;
+    return dsp::wav::LoadReturnCode::ERROR_INVALID_FILE;
   }
 
   wfd.fmtChunk.sampleRate = ReadInt(wavFile);
@@ -333,6 +334,27 @@ dsp::wav::LoadReturnCode ReadDataChunk(std::ifstream& wavFile, WaveFileData& wfd
     std::cerr << "Error: Unsupported audio format: " << audioFormat << std::endl;
     return dsp::wav::LoadReturnCode::ERROR_UNSUPPORTED_FORMAT_OTHER;
   }
+
+  // VoLum: downmix interleaved multi-channel audio to mono by averaging the
+  // channels of each frame. Averaging (not summing) keeps the level sane so a
+  // stereo IR convolves at the same gain as its mono equivalent.
+  const int numChannels = wfd.fmtChunk.numChannels;
+  if (numChannels > 1 && !audio.empty())
+  {
+    const size_t numFrames = audio.size() / (size_t)numChannels;
+    std::vector<float> mono(numFrames);
+    const float invChannels = 1.0f / (float)numChannels;
+    for (size_t f = 0; f < numFrames; f++)
+    {
+      float acc = 0.0f;
+      const size_t base = f * (size_t)numChannels;
+      for (int c = 0; c < numChannels; c++)
+        acc += audio[base + (size_t)c];
+      mono[f] = acc * invChannels;
+    }
+    audio = std::move(mono);
+  }
+
   wfd.dataChunk.valid = true;
   return dsp::wav::LoadReturnCode::SUCCESS;
 }
