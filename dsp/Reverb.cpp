@@ -15,9 +15,18 @@ namespace effect
 static constexpr double kPI = 3.14159265358979323846;
 static constexpr double kTwoPI = 2.0 * kPI;
 
-static size_t ScaleDelay(double ms, double sr) { return std::max<size_t>(1, static_cast<size_t>(ms * sr / 1000.0)); }
-static size_t ScaleFromRef(size_t refLen, double refSR, double sr) { return std::max<size_t>(1, static_cast<size_t>(refLen * sr / refSR)); }
-static double Hann(double phase) { return 0.5 - 0.5 * std::cos(kTwoPI * phase); }
+static size_t ScaleDelay(double ms, double sr)
+{
+  return std::max<size_t>(1, static_cast<size_t>(ms * sr / 1000.0));
+}
+static size_t ScaleFromRef(size_t refLen, double refSR, double sr)
+{
+  return std::max<size_t>(1, static_cast<size_t>(refLen * sr / refSR));
+}
+static double Hann(double phase)
+{
+  return 0.5 - 0.5 * std::cos(kTwoPI * phase);
+}
 
 static double Hash01(unsigned int x)
 {
@@ -29,7 +38,11 @@ static double Hash01(unsigned int x)
   return static_cast<double>(x & 0x00ffffffU) / static_cast<double>(0x01000000U);
 }
 
-static double LPTick(double& state, double in, double coef) { state += coef * (in - state); return state; }
+static double LPTick(double& state, double in, double coef)
+{
+  state += coef * (in - state);
+  return state;
+}
 
 // Soft saturator used only by Oktaverb. Bounded in (-1, +1) for any finite input thanks
 // to std::tanh; effectively transparent below ~0.3, gentle compression above, hard
@@ -44,7 +57,8 @@ static double SoftSaturate(double x)
 
 static double AllpassTick(std::vector<double>& buf, size_t& idx, size_t len, double input, double coef)
 {
-  if (len == 0 || buf.empty()) return input;
+  if (len == 0 || buf.empty())
+    return input;
   size_t bufSz = buf.size();
   size_t readIdx = (idx + bufSz - len) % bufSz;
   double delayed = buf[readIdx];
@@ -52,6 +66,36 @@ static double AllpassTick(std::vector<double>& buf, size_t& idx, size_t len, dou
   buf[idx] = v;
   idx = (idx + 1) % bufSz;
   return delayed - coef * v;
+}
+
+// As above, but the read tap moves. Dattorro's plate modulates decay diffusion 1 by a
+// few samples ("excursion") so the tank cannot settle into a fixed resonance.
+static double ModulatedAllpassTick(std::vector<double>& buf, size_t& idx, size_t len, double input, double coef,
+                                   double modSamples)
+{
+  if (len == 0 || buf.empty())
+    return input;
+  const size_t bufSz = buf.size();
+  double readPos = static_cast<double>(idx) - static_cast<double>(len) - modSamples;
+  while (readPos < 0.0)
+    readPos += static_cast<double>(bufSz);
+  const size_t i0 = static_cast<size_t>(readPos) % bufSz;
+  const size_t i1 = (i0 + 1) % bufSz;
+  const double frac = readPos - std::floor(readPos);
+  const double delayed = buf[i0] * (1.0 - frac) + buf[i1] * frac;
+  const double v = input + coef * delayed;
+  buf[idx] = v;
+  idx = (idx + 1) % bufSz;
+  return delayed - coef * v;
+}
+
+// Read a circular buffer `offset` samples behind its write head.
+static double ReadBufAt(const std::vector<double>& buf, size_t idx, size_t offset)
+{
+  if (buf.empty())
+    return 0.0;
+  const size_t sz = buf.size();
+  return buf[(idx + sz - (offset % sz)) % sz];
 }
 
 namespace
@@ -64,7 +108,7 @@ struct HallSubModeChar
   double lengthScale;
   double cutoffOctaveOffset; // added to log2(cutoff)
   double modDepthScale;
-  bool   chorusedTail;
+  bool chorusedTail;
 };
 
 HallSubModeChar GetHallSubMode(int sub)
@@ -72,7 +116,7 @@ HallSubModeChar GetHallSubMode(int sub)
   switch (sub)
   {
     case 0: return {0.50, +1.5, 0.5, false}; // Studio
-    case 2: return {1.70, -0.5, 1.5, true};  // Cathedral
+    case 2: return {1.70, -0.5, 1.5, true}; // Cathedral
     case 1:
     default: return {1.00, 0.0, 1.0, false}; // Concert
   }
@@ -117,18 +161,19 @@ OktaverbSubModeChar GetOktaverbSubMode(int sub)
   {
     // Shimmer: bright FDN, +12 in feedback as the spine, no secondary voice, parallel +12
     // voice for body lift, wet boosted so Mix at ~30 percent reads over the dry amp signal.
-    case 1: return {kOctaveUpRatio, 0.42, 1.0, 0.0, kOctaveUpRatio, 0.32,
-                    0.75, 1200.0, 5000.0, 12000.0, 14.0, 1.10, 1.55, false};
+    case 1:
+      return {
+        kOctaveUpRatio, 0.42, 1.0, 0.0, kOctaveUpRatio, 0.32, 0.75, 1200.0, 5000.0, 12000.0, 14.0, 1.10, 1.55, false};
     // Bloom: no pitch shifting, swell-driven envelope. It shares the same final output
     // safety as Halo/Shimmer so its default swell cannot clip when dry and wet align.
-    case 2: return {1.0, 0.0, 1.0, 0.0, 1.0, 0.0,
-                    0.50, 1200.0, 4700.0, 9500.0, 9.0, 1.25, 1.40, true};
+    case 2: return {1.0, 0.0, 1.0, 0.0, 1.0, 0.0, 0.50, 1200.0, 4700.0, 9500.0, 9.0, 1.25, 1.40, true};
     case 0:
     // Halo (Dual): both +12 and -12 in the feedback loop simultaneously (Valhalla Dual
     // / Meris Pitch Vector lineage). Bright FDN keeps the body audible; -12 brings the
     // doom-octave weight without burying the high-end. No parallel voice.
-    default: return {kOctaveUpRatio, 0.30, kOctaveDownRatio, 0.30, 1.0, 0.0,
-                     0.78, 1100.0, 4600.0, 11000.0, 11.0, 1.05, 1.55, false};
+    default:
+      return {
+        kOctaveUpRatio, 0.30, kOctaveDownRatio, 0.30, 1.0, 0.0, 0.78, 1100.0, 4600.0, 11000.0, 11.0, 1.05, 1.55, false};
   }
 }
 
@@ -146,6 +191,14 @@ Reverb::Reverb()
   mInputAPIdx.resize(kInputAPs, 0);
   mInputAPLen.resize(kInputAPs, 0);
 
+  mFdnAPBuf.resize(kFdnDiffusers);
+  mFdnAPIdx.resize(kFdnDiffusers, 0);
+  mFdnAPLen.resize(kFdnDiffusers, 0);
+
+  mFdnEarlyAPBuf.resize(kFdnEarlyAPs);
+  mFdnEarlyAPIdx.resize(kFdnEarlyAPs, 0);
+  mFdnEarlyAPLen.resize(kFdnEarlyAPs, 0);
+
   mPitchBufs.resize(kNumPitchVoices);
   mPitchWriteIdx.resize(kNumPitchVoices);
   mPitchPhase.resize(kNumPitchVoices);
@@ -156,9 +209,6 @@ Reverb::Reverb()
     mPitchPhase[v].assign(kHallLines, 0.0);
   }
 
-  mPitchedPreBuf.resize(kHallLines);
-  mPitchedPreIdx.assign(kHallLines, 0);
-  mPitchedDetunePhase.assign(kHallLines, 0.0);
   mOktaverbLfoPhase.assign(kHallLines, 0.0);
   mOktaverbPitchLPState.assign(kHallLines, 0.0);
   mOktaverbFeedbackPitchLPState.assign(kHallLines, 0.0);
@@ -183,9 +233,12 @@ void Reverb::Prepare(const size_t numChannels, const size_t numFrames, double sa
     _AllocatePreDelay();
   }
 
-  if (!mHallAllocated) _AllocateHall();
-  if (!mPlateAllocated) _AllocatePlate();
-  if (!mOktaverbAllocated) _AllocateOktaverb();
+  if (!mHallAllocated)
+    _AllocateHall();
+  if (!mPlateAllocated)
+    _AllocatePlate();
+  if (!mOktaverbAllocated)
+    _AllocateOktaverb();
 }
 
 void Reverb::SetParams(double mix, double decay, double tone, double preDelayMs, double shimmer, int mode,
@@ -246,8 +299,10 @@ void Reverb::SetParams(double mix, double decay, double tone, double preDelayMs,
     _AllocatePlate();
   if (mMode == kModeOktaverb)
   {
-    if (!mHallAllocated) _AllocateHall();
-    if (!mOktaverbAllocated) _AllocateOktaverb();
+    if (!mHallAllocated)
+      _AllocateHall();
+    if (!mOktaverbAllocated)
+      _AllocateOktaverb();
   }
 
   // Hall (FDN), Plate (Dattorro), and Oktaverb share some allocations (kHallLines /
@@ -294,6 +349,29 @@ void Reverb::_AllocateHall()
     mHallChorusPhase[i] = 0.0;
   }
   mHallLfoPhase = 0.0;
+
+  // Input diffuser. Mutually prime lengths so the nested allpasses do not reinforce
+  // each other at a common period; the 0.75 / 0.625 coefficient pair is Dattorro's.
+  const double fdnDiffuserMs[kFdnDiffusers] = {4.3, 6.7, 10.1, 14.9};
+  for (int i = 0; i < kFdnDiffusers; i++)
+  {
+    mFdnAPLen[i] = ScaleDelay(fdnDiffuserMs[i], mSampleRate);
+    mFdnAPBuf[i].assign(mFdnAPLen[i] + 16, 0.0);
+    mFdnAPIdx[i] = 0;
+  }
+
+  // One more allpass per output channel, longer than any in the shared chain and
+  // mutually prime with it, so left and right carry the same energy at different
+  // instants. They inherit the chain's density; on their own a single long allpass
+  // would just ring at multiples of its own delay.
+  const double earlyAPMs[kFdnEarlyAPs] = {20.3, 27.7};
+  for (int i = 0; i < kFdnEarlyAPs; i++)
+  {
+    mFdnEarlyAPLen[i] = ScaleDelay(earlyAPMs[i], mSampleRate);
+    mFdnEarlyAPBuf[i].assign(mFdnEarlyAPLen[i] + 16, 0.0);
+    mFdnEarlyAPIdx[i] = 0;
+  }
+
   mHallAllocated = true;
 }
 
@@ -309,13 +387,8 @@ void Reverb::_AllocateOktaverb()
       mPitchPhase[v][i] = 0.0;
     }
   }
-  // Pitched pre-delay buffer per line (sized for max 120 ms).
-  const size_t maxPitchedPre = ScaleDelay(150.0, mSampleRate);
   for (int i = 0; i < kHallLines; i++)
   {
-    mPitchedPreBuf[i].assign(maxPitchedPre + 4, 0.0);
-    mPitchedPreIdx[i] = 0;
-    mPitchedDetunePhase[i] = static_cast<double>(i) / kHallLines; // staggered phase
     mOktaverbLfoPhase[i] = static_cast<double>(i) / kHallLines;
     mOktaverbPitchLPState[i] = 0.0;
     mOktaverbFeedbackPitchLPState[i] = 0.0;
@@ -342,20 +415,47 @@ void Reverb::_AllocatePlate()
 
   const size_t tankAPRef[2] = {672, 908};
   const size_t tankDelRef[2] = {4453, 4217};
+  // Decay diffusion 2 and the second delay, absent through 1.2.0. They carry the
+  // asymmetry between the halves: with them the loops are 10645 and 10944 samples,
+  // without them both are 5125.
+  const size_t tankAP2Ref[2] = {1800, 2656};
+  const size_t tankDel2Ref[2] = {3720, 3163};
 
   for (int h = 0; h < 2; h++)
   {
     mTank[h].apLen = ScaleFromRef(tankAPRef[h], refSR, mSampleRate);
-    mTank[h].apBuf.assign(mTank[h].apLen + 32, 0.0);
+    mTank[h].apBuf.assign(mTank[h].apLen + 64, 0.0);
     mTank[h].apIdx = 0;
 
     mTank[h].delLen = ScaleFromRef(tankDelRef[h], refSR, mSampleRate);
     mTank[h].delBuf.assign(mTank[h].delLen + 32, 0.0);
     mTank[h].delIdx = 0;
 
+    mTank[h].ap2Len = ScaleFromRef(tankAP2Ref[h], refSR, mSampleRate);
+    mTank[h].ap2Buf.assign(mTank[h].ap2Len + 32, 0.0);
+    mTank[h].ap2Idx = 0;
+
+    mTank[h].del2Len = ScaleFromRef(tankDel2Ref[h], refSR, mSampleRate);
+    mTank[h].del2Buf.assign(mTank[h].del2Len + 32, 0.0);
+    mTank[h].del2Idx = 0;
+
     mTank[h].lpState = 0.0;
     mTank[h].lastOut = 0.0;
   }
+
+  // Dattorro's output accumulators. Each channel reads four taps from the opposite
+  // half and three from its own, which is where the stereo image comes from - not from
+  // panning one half left and the other right, which is what 1.2.0 did.
+  // Order per channel: delay1[a], delay1[b], ap2[c], delay2[d] of the far half, then
+  // delay1[e], ap2[f], delay2[g] of the near half.
+  const size_t tapLRef[kPlateOutTaps] = {266, 2974, 1913, 1996, 1990, 187, 1066};
+  const size_t tapRRef[kPlateOutTaps] = {353, 3627, 1228, 2673, 2111, 335, 121};
+  for (int t = 0; t < kPlateOutTaps; t++)
+  {
+    mPlateTapL[t] = ScaleFromRef(tapLRef[t], refSR, mSampleRate);
+    mPlateTapR[t] = ScaleFromRef(tapRRef[t], refSR, mSampleRate);
+  }
+
   mInputLPState = 0.0;
   mPlateLfoPhase = 0.0;
   mPlateAllocated = true;
@@ -375,12 +475,26 @@ void Reverb::Reset()
     std::fill(mInputAPBuf[i].begin(), mInputAPBuf[i].end(), 0.0);
     mInputAPIdx[i] = 0;
   }
+  for (int i = 0; i < kFdnDiffusers; i++)
+  {
+    std::fill(mFdnAPBuf[i].begin(), mFdnAPBuf[i].end(), 0.0);
+    mFdnAPIdx[i] = 0;
+  }
+  for (int i = 0; i < kFdnEarlyAPs; i++)
+  {
+    std::fill(mFdnEarlyAPBuf[i].begin(), mFdnEarlyAPBuf[i].end(), 0.0);
+    mFdnEarlyAPIdx[i] = 0;
+  }
   for (int h = 0; h < 2; h++)
   {
     std::fill(mTank[h].apBuf.begin(), mTank[h].apBuf.end(), 0.0);
     mTank[h].apIdx = 0;
     std::fill(mTank[h].delBuf.begin(), mTank[h].delBuf.end(), 0.0);
     mTank[h].delIdx = 0;
+    std::fill(mTank[h].ap2Buf.begin(), mTank[h].ap2Buf.end(), 0.0);
+    mTank[h].ap2Idx = 0;
+    std::fill(mTank[h].del2Buf.begin(), mTank[h].del2Buf.end(), 0.0);
+    mTank[h].del2Idx = 0;
     mTank[h].lpState = 0.0;
     mTank[h].lastOut = 0.0;
   }
@@ -395,9 +509,6 @@ void Reverb::Reset()
     }
   for (int i = 0; i < kHallLines; i++)
   {
-    std::fill(mPitchedPreBuf[i].begin(), mPitchedPreBuf[i].end(), 0.0);
-    mPitchedPreIdx[i] = 0;
-    mPitchedDetunePhase[i] = static_cast<double>(i) / kHallLines;
     mOktaverbLfoPhase[i] = static_cast<double>(i) / kHallLines;
     mOktaverbPitchLPState[i] = 0.0;
     mOktaverbFeedbackPitchLPState[i] = 0.0;
@@ -429,6 +540,28 @@ DSP_SAMPLE** Reverb::Process(DSP_SAMPLE** inputs, const size_t numChannels, cons
   }
 
   return _GetPointers();
+}
+
+// Nested allpass chain in front of the FDN. Each stage spreads an impulse into a
+// decaying series of its own, so by the time the signal reaches the delay lines it is
+// already a burst rather than a spike, and the eight line reads overlap into something
+// continuous instead of arriving as eight separate events.
+double Reverb::_DiffuseFdnInput(double input)
+{
+  static const double coefs[kFdnDiffusers] = {0.75, 0.75, 0.625, 0.625};
+  double sig = input;
+  for (int i = 0; i < kFdnDiffusers; i++)
+    sig = AllpassTick(mFdnAPBuf[i], mFdnAPIdx[i], mFdnAPLen[i], sig, coefs[i]);
+  return sig;
+}
+
+// The early field. Both channels are the diffuser output taken one allpass further,
+// which spreads it over another few tens of milliseconds without touching its
+// magnitude response, and differently for each channel.
+void Reverb::_FdnEarlyField(double diffused, double& outL, double& outR)
+{
+  outL = AllpassTick(mFdnEarlyAPBuf[0], mFdnEarlyAPIdx[0], mFdnEarlyAPLen[0], diffused, 0.6);
+  outR = AllpassTick(mFdnEarlyAPBuf[1], mFdnEarlyAPIdx[1], mFdnEarlyAPLen[1], diffused, 0.6);
 }
 
 double Reverb::_ReadWritePreDelay(double input)
@@ -528,11 +661,21 @@ double Reverb::_ToneToCutoff(double minHz, double midHz, double maxHz) const
 
 void Reverb::_ProcessHall(DSP_SAMPLE** inputs, const size_t numChannels, const size_t numFrames)
 {
-  // The good iteration-2 Cathedral-ish recipe becomes the single staging Hall.
-  // It is intentionally less extreme than a traditional cathedral preset.
+  // Same Cathedral-ish recipe as before - line lengths, loop gain, Hadamard matrix and
+  // tone curve are untouched, so the tail is the one we had. What changed is how the
+  // tank is excited and where the output is read from:
+  //
+  //   * the input runs through a nested allpass diffuser first, so each line receives a
+  //     burst instead of a spike;
+  //   * the lines are fed through a balanced sign pattern rather than all receiving the
+  //     identical sample, so they stop reinforcing each other;
+  //   * short taps read inside the lines, so wet energy exists before the shortest loop
+  //     (52.7 ms) can produce any.
+  //
+  // Together those turn the first pass from eight audible clicks into a continuous
+  // early field, and they take the hidden 52.7 ms floor out from under PRE-DLY.
   const HallSubModeChar sm = GetHallSubMode(2);
 
-  // Compute effective per-line lengths from base lengths × sub-mode scale.
   size_t effLengths[kHallLines];
   for (int i = 0; i < kHallLines; i++)
   {
@@ -546,7 +689,6 @@ void Reverb::_ProcessHall(DSP_SAMPLE** inputs, const size_t numChannels, const s
   double loopGain = std::pow(10.0, -3.0 * avgDelay / mDecay);
   loopGain = std::min(loopGain, 0.998);
 
-  // Tone curve: dark side compressed; sub-mode shifts cutoff up/down.
   const double cutoffBase = _ToneToCutoff(1500.0, 5000.0, 10000.0);
   const double cutoffHz = std::clamp(cutoffBase * std::pow(2.0, sm.cutoffOctaveOffset), 500.0, 18000.0);
   const double rc = 1.0 / (2.0 * kPI * cutoffHz);
@@ -554,32 +696,42 @@ void Reverb::_ProcessHall(DSP_SAMPLE** inputs, const size_t numChannels, const s
   const double lpCoef = dt / (rc + dt);
 
   const double H = 0.35355339;
-  static const double mixMat[8][8] = {
-    {H, H, H, H, H, H, H, H},
-    {H, -H, H, -H, H, -H, H, -H},
-    {H, H, -H, -H, H, H, -H, -H},
-    {H, -H, -H, H, H, -H, -H, H},
-    {H, H, H, H, -H, -H, -H, -H},
-    {H, -H, H, -H, -H, H, -H, H},
-    {H, H, -H, -H, -H, -H, H, H},
-    {H, -H, -H, H, -H, H, H, -H}};
+  static const double mixMat[8][8] = {{H, H, H, H, H, H, H, H},     {H, -H, H, -H, H, -H, H, -H},
+                                      {H, H, -H, -H, H, H, -H, -H}, {H, -H, -H, H, H, -H, -H, H},
+                                      {H, H, H, H, -H, -H, -H, -H}, {H, -H, H, -H, -H, H, -H, H},
+                                      {H, H, -H, -H, -H, -H, H, H}, {H, -H, -H, H, -H, H, H, -H}};
+
+  // Balanced +/- injection. Any zero-sum pattern works; what matters is that the lines
+  // no longer see the same sample with the same sign.
+  static const double injectSign[kHallLines] = {1.0, 1.0, -1.0, 1.0, -1.0, -1.0, 1.0, -1.0};
 
   const double lfoRate = 0.6 * 2.0 * kPI / mSampleRate;
   const double lfoDepth = 10.0 * sm.modDepthScale;
 
-  // Cathedral: per-line slow detune on read tap (~0.2 Hz, 6 cents -> small frame fraction).
   const double cathRate = 0.2 / mSampleRate;
   const double cathDepth = sm.chorusedTail ? 4.0 : 0.0;
+
+  // The early field is loud enough to close the gap without turning into a slapback of
+  // its own; the tank still carries the body.
+  const double earlyGain = 0.15;
 
   for (size_t s = 0; s < numFrames; s++)
   {
     mHallLfoPhase += lfoRate;
-    if (mHallLfoPhase > 2.0 * kPI) mHallLfoPhase -= 2.0 * kPI;
+    if (mHallLfoPhase > 2.0 * kPI)
+      mHallLfoPhase -= 2.0 * kPI;
 
     double in = 0.0;
-    for (size_t c = 0; c < numChannels; c++) in += inputs[c][s];
-    if (numChannels > 1) in *= 0.5;
+    for (size_t c = 0; c < numChannels; c++)
+      in += inputs[c][s];
+    if (numChannels > 1)
+      in *= 0.5;
     in = _ReadWritePreDelay(in);
+    const double diffused = _DiffuseFdnInput(in);
+
+    double earlyL = 0.0;
+    double earlyR = 0.0;
+    _FdnEarlyField(diffused, earlyL, earlyR);
 
     double readVals[8];
     for (int i = 0; i < kHallLines; i++)
@@ -589,13 +741,15 @@ void Reverb::_ProcessHall(DSP_SAMPLE** inputs, const size_t numChannels, const s
       if (sm.chorusedTail)
       {
         mHallChorusPhase[i] += cathRate;
-        if (mHallChorusPhase[i] >= 1.0) mHallChorusPhase[i] -= 1.0;
+        if (mHallChorusPhase[i] >= 1.0)
+          mHallChorusPhase[i] -= 1.0;
         cathOffset = std::sin(2.0 * kPI * mHallChorusPhase[i]) * cathDepth;
       }
 
       double readPos = static_cast<double>(mHallIndices[i]) - static_cast<double>(effLengths[i]) - mod - cathOffset;
       const size_t bufSz = mHallDelays[i].size();
-      while (readPos < 0.0) readPos += bufSz;
+      while (readPos < 0.0)
+        readPos += bufSz;
       const size_t i0 = static_cast<size_t>(readPos) % bufSz;
       const size_t i1 = (i0 + 1) % bufSz;
       const double frac = readPos - std::floor(readPos);
@@ -608,15 +762,20 @@ void Reverb::_ProcessHall(DSP_SAMPLE** inputs, const size_t numChannels, const s
     for (int i = 0; i < kHallLines; i++)
     {
       double fb = 0.0;
-      for (int j = 0; j < kHallLines; j++) fb += mixMat[i][j] * readVals[j];
-      double write = in * 0.5 + fb;
-      if (!std::isfinite(write)) { write = 0.0; Reset(); }
+      for (int j = 0; j < kHallLines; j++)
+        fb += mixMat[i][j] * readVals[j];
+      double write = diffused * 0.5 * injectSign[i] + fb;
+      if (!std::isfinite(write))
+      {
+        write = 0.0;
+        Reset();
+      }
       mHallDelays[i][mHallIndices[i]] = std::clamp(write, -3.0, 3.0);
       mHallIndices[i] = (mHallIndices[i] + 1) % mHallDelays[i].size();
     }
 
-    const double outL = (readVals[0] + readVals[2] - readVals[4] + readVals[6]) * 0.5;
-    const double outR = (readVals[1] - readVals[3] + readVals[5] + readVals[7]) * 0.5;
+    const double outL = (readVals[0] + readVals[2] - readVals[4] + readVals[6]) * 0.5 + earlyL * earlyGain;
+    const double outR = (readVals[1] - readVals[3] + readVals[5] + readVals[7]) * 0.5 + earlyR * earlyGain;
 
     // Equal-power crossfade. Pre-equal-power VoLum used `dry + wet*mMix` (additive),
     // which kept dry at unity at every Mix value and left reverb feeling "too quiet"
@@ -633,7 +792,11 @@ void Reverb::_ProcessHall(DSP_SAMPLE** inputs, const size_t numChannels, const s
     {
       const double wet = (c == 0) ? outL : outR;
       double final_ = inputs[c][s] * dryCoef + wet * wetCoef;
-      if (std::isnan(final_) || std::isinf(final_)) { final_ = 0.0; Reset(); }
+      if (std::isnan(final_) || std::isinf(final_))
+      {
+        final_ = 0.0;
+        Reset();
+      }
       mOutputs[c][s] = static_cast<DSP_SAMPLE>(final_);
     }
   }
@@ -644,6 +807,14 @@ void Reverb::_ProcessHall(DSP_SAMPLE** inputs, const size_t numChannels, const s
 void Reverb::_ProcessOktaverb(DSP_SAMPLE** inputs, const size_t numChannels, const size_t numFrames)
 {
   const OktaverbSubModeChar sm = GetOktaverbSubMode(mSubMode);
+
+  // Oktaverb runs the same FDN as Hall at the unscaled length set, so it had the same
+  // bare first pass - eight discrete taps between 31 and 89 ms - just less obvious,
+  // because the taps sit closer together and the pitch grains smear everything after
+  // the first generation. It takes Hall's input stage: diffuser, balanced injection and
+  // early taps. Everything downstream of the tank write is unchanged.
+  static const double injectSign[kHallLines] = {1.0, 1.0, -1.0, 1.0, -1.0, -1.0, 1.0, -1.0};
+  const double earlyGain = 0.15;
 
   const double avgDelay = 58.0 / 1000.0;
   double loopGain = std::pow(10.0, -3.0 * avgDelay / mDecay);
@@ -664,15 +835,10 @@ void Reverb::_ProcessOktaverb(DSP_SAMPLE** inputs, const size_t numChannels, con
   const double pitchHpLpCoef = 1.0 - std::exp(-2.0 * kPI * pitchHpCutoffHz / mSampleRate);
 
   const double H = 0.35355339;
-  static const double mixMat[8][8] = {
-    {H, H, H, H, H, H, H, H},
-    {H, -H, H, -H, H, -H, H, -H},
-    {H, H, -H, -H, H, H, -H, -H},
-    {H, -H, -H, H, H, -H, -H, H},
-    {H, H, H, H, -H, -H, -H, -H},
-    {H, -H, H, -H, -H, H, -H, H},
-    {H, H, -H, -H, -H, -H, H, H},
-    {H, -H, -H, H, -H, H, H, -H}};
+  static const double mixMat[8][8] = {{H, H, H, H, H, H, H, H},     {H, -H, H, -H, H, -H, H, -H},
+                                      {H, H, -H, -H, H, H, -H, -H}, {H, -H, -H, H, H, -H, -H, H},
+                                      {H, H, H, H, -H, -H, -H, -H}, {H, -H, H, -H, -H, H, -H, H},
+                                      {H, H, -H, -H, -H, -H, H, H}, {H, -H, -H, H, -H, H, H, -H}};
 
   static const double lfoRatesHz[kHallLines] = {0.31, 0.43, 0.57, 0.71, 0.83, 0.97, 1.13, 1.29};
   const double intensity = std::clamp(mShimmer, 0.0, 1.0);
@@ -694,9 +860,16 @@ void Reverb::_ProcessOktaverb(DSP_SAMPLE** inputs, const size_t numChannels, con
   for (size_t s = 0; s < numFrames; s++)
   {
     double in = 0.0;
-    for (size_t c = 0; c < numChannels; c++) in += inputs[c][s];
-    if (numChannels > 1) in *= 0.5;
+    for (size_t c = 0; c < numChannels; c++)
+      in += inputs[c][s];
+    if (numChannels > 1)
+      in *= 0.5;
     in = _ReadWritePreDelay(in);
+    const double tankSource = _DiffuseFdnInput(in);
+
+    double earlyL = 0.0;
+    double earlyR = 0.0;
+    _FdnEarlyField(tankSource, earlyL, earlyR);
 
     double readVals[8];
     double parallelPitchVals[8];
@@ -709,7 +882,8 @@ void Reverb::_ProcessOktaverb(DSP_SAMPLE** inputs, const size_t numChannels, con
       const double mod = std::sin(kTwoPI * mOktaverbLfoPhase[i]) * sm.modulationDepth;
       double readPos = static_cast<double>(mHallIndices[i]) - static_cast<double>(mHallLengths[i]) - mod;
       const size_t bufSz = mHallDelays[i].size();
-      while (readPos < 0.0) readPos += bufSz;
+      while (readPos < 0.0)
+        readPos += bufSz;
       const size_t i0 = static_cast<size_t>(readPos) % bufSz;
       const size_t i1 = (i0 + 1) % bufSz;
       const double frac = readPos - std::floor(readPos);
@@ -754,10 +928,9 @@ void Reverb::_ProcessOktaverb(DSP_SAMPLE** inputs, const size_t numChannels, con
           // Secondary voice (Halo): -12 with its own decorrelated tap mix to keep the
           // dual character lush instead of phasey.
           const double pitchSourceSecondary =
-            0.25 * (readVals[(i + 4) % kHallLines] - readVals[(i + 1) % kHallLines]
-                    + readVals[(i + 7) % kHallLines]);
-          const double secondary = _PitchShiftTick(
-            kVoiceOctDownFeedback, i, pitchSourceSecondary, sm.secondaryFeedbackPitchRatio);
+            0.25 * (readVals[(i + 4) % kHallLines] - readVals[(i + 1) % kHallLines] + readVals[(i + 7) % kHallLines]);
+          const double secondary =
+            _PitchShiftTick(kVoiceOctDownFeedback, i, pitchSourceSecondary, sm.secondaryFeedbackPitchRatio);
           pitched += secondary * secondaryFeedbackPitchGain;
         }
         // LP and HP are linear so summing voices first then filtering matches per-voice
@@ -767,24 +940,34 @@ void Reverb::_ProcessOktaverb(DSP_SAMPLE** inputs, const size_t numChannels, con
         pitched -= lowRumble;
         fb += std::clamp(pitched, -0.65, 0.65);
       }
-      const double tankIn = sm.bloom ? in : in * sm.inputGain;
+      double tankIn = sm.bloom ? tankSource : tankSource * sm.inputGain;
+      tankIn *= injectSign[i];
       double write = tankIn + fb;
-      if (!std::isfinite(write)) { write = 0.0; Reset(); }
+      if (!std::isfinite(write))
+      {
+        write = 0.0;
+        Reset();
+      }
       mHallDelays[i][mHallIndices[i]] = std::clamp(write, -2.0, 2.0);
       mHallIndices[i] = (mHallIndices[i] + 1) % mHallDelays[i].size();
     }
 
-    const double center = (readVals[0] + readVals[1] + readVals[2] + readVals[3] +
-                           readVals[4] + readVals[5] + readVals[6] + readVals[7]) * 0.125;
+    const double center =
+      (readVals[0] + readVals[1] + readVals[2] + readVals[3] + readVals[4] + readVals[5] + readVals[6] + readVals[7])
+      * 0.125;
     const double hallTapL = (readVals[0] + readVals[2] - readVals[4] + readVals[6]) * 0.5;
     const double hallTapR = (readVals[1] - readVals[3] + readVals[5] + readVals[7]) * 0.5;
     const double hallOutL = center * (1.0 - sm.wetWidth) + hallTapL * sm.wetWidth;
     const double hallOutR = center * (1.0 - sm.wetWidth) + hallTapR * sm.wetWidth;
-    const double pitchOutL = (parallelPitchVals[0] + parallelPitchVals[2] - parallelPitchVals[4] + parallelPitchVals[6]) * 0.5;
-    const double pitchOutR = (parallelPitchVals[1] - parallelPitchVals[3] + parallelPitchVals[5] + parallelPitchVals[7]) * 0.5;
+    const double pitchOutL =
+      (parallelPitchVals[0] + parallelPitchVals[2] - parallelPitchVals[4] + parallelPitchVals[6]) * 0.5;
+    const double pitchOutR =
+      (parallelPitchVals[1] - parallelPitchVals[3] + parallelPitchVals[5] + parallelPitchVals[7]) * 0.5;
     const double bloomGain = sm.bloom ? mBloomVCA : 1.0;
-    const double outL = (hallOutL + pitchOutL) * bloomGain * sm.wetGain;
-    const double outR = (hallOutR + pitchOutR) * bloomGain * sm.wetGain;
+    // The early field joins before the bloom VCA, so Bloom still swells from silence
+    // rather than announcing itself with an early transient.
+    const double outL = (hallOutL + pitchOutL + earlyL * earlyGain) * bloomGain * sm.wetGain;
+    const double outR = (hallOutR + pitchOutR + earlyR * earlyGain) * bloomGain * sm.wetGain;
 
     // Safety stack scoped to Oktaverb:
     //   1. User's Mix knob internally scaled to 50 percent maximum, so the wet
@@ -811,7 +994,11 @@ void Reverb::_ProcessOktaverb(DSP_SAMPLE** inputs, const size_t numChannels, con
       const double wet = sm.bloom ? rawWet : SoftSaturate(rawWet);
       double mixed = inputs[c][s] * dryCoef + wet * wetCoef;
       double final_ = (sm.bloom && mMix <= 0.0) ? mixed : SoftSaturate(mixed);
-      if (std::isnan(final_) || std::isinf(final_)) { final_ = 0.0; Reset(); }
+      if (std::isnan(final_) || std::isinf(final_))
+      {
+        final_ = 0.0;
+        Reset();
+      }
       mOutputs[c][s] = static_cast<DSP_SAMPLE>(final_);
     }
   }
@@ -821,12 +1008,36 @@ void Reverb::_ProcessOktaverb(DSP_SAMPLE** inputs, const size_t numChannels, con
 
 void Reverb::_ProcessPlate(DSP_SAMPLE** inputs, const size_t numChannels, const size_t numFrames)
 {
+  // Dattorro's plate, now complete. Through 1.2.0 each tank half was one allpass and
+  // one delay, and the output was a single tap off the end of each half. Two things
+  // followed from that. Both halves came to exactly 5125 samples - 672 + 4453 and
+  // 908 + 4217 - because the stages that carry the asymmetry were the missing ones, so
+  // the halves rang in lockstep and produced one centred repeat every 172 ms. And with
+  // no taps inside the lines there was nothing between those repeats, nor anything at
+  // all before the first one.
+  //
+  // Restored here: decay diffusion 2 and the second delay per half, and the seven-tap
+  // output accumulators. The tank is now 10645 and 10944 samples, and the taps read
+  // from inside both halves, so the response is dense from the first millisecond.
   const double inDiff1 = 0.75;
   const double inDiff2 = 0.625;
   const double inDiffCoefs[kInputAPs] = {inDiff1, inDiff1, inDiff2, inDiff2};
 
-  double decayGain = std::clamp(1.0 - (1.0 / (mDecay + 0.1)), 0.1, 0.97);
-  double decayDiff = 0.7;
+  // Decay is now solved for the loop rather than approximated. The old
+  // `1 - 1/(decay + 0.1)` was tuned against a tank half this size, so reusing it with
+  // the full-length tank would have roughly doubled every decay time. Solving for RT60
+  // keeps the knob honest in seconds - which is what its unit claims - and happens to
+  // land within a few percent of the old curve through the middle of the range.
+  const double tankSeconds = (mTank[0].apLen + mTank[0].delLen + mTank[0].ap2Len + mTank[0].del2Len + mTank[1].apLen
+                              + mTank[1].delLen + mTank[1].ap2Len + mTank[1].del2Len)
+                             / std::max(1.0, mSampleRate);
+  // Per crossing, so one full trip through both halves attenuates by 60 dB after
+  // mDecay seconds.
+  double decayGain = std::pow(10.0, -3.0 * (tankSeconds * 0.5) / mDecay);
+  decayGain = std::clamp(decayGain, 0.05, 0.98);
+
+  const double decayDiff1 = 0.70;
+  const double decayDiff2 = 0.50;
 
   double cutoffHz = 1000.0 + (mTone / 10.0) * 14000.0;
   const double rc = 1.0 / (2.0 * kPI * cutoffHz);
@@ -835,17 +1046,26 @@ void Reverb::_ProcessPlate(DSP_SAMPLE** inputs, const size_t numChannels, const 
 
   const double bwCoef = 0.9995;
 
-  double modRate = 1.0 * 2.0 * kPI / mSampleRate;
-  double modDepth = 16.0 * mSampleRate / 29761.0;
+  // Excursion belongs on decay diffusion 1, per the reference; 1.2.0 modulated the
+  // delay read instead.
+  const double modRate = 1.0 * 2.0 * kPI / mSampleRate;
+  const double modDepth = 16.0 * mSampleRate / 29761.0;
+
+  // Dattorro's accumulator gain. The seven taps partly cancel, so this lands close to
+  // the single-tap level the old path produced; kReverbWetTrim still applies on top.
+  const double tapGain = 0.22;
 
   for (size_t s = 0; s < numFrames; s++)
   {
     mPlateLfoPhase += modRate;
-    if (mPlateLfoPhase > 2.0 * kPI) mPlateLfoPhase -= 2.0 * kPI;
+    if (mPlateLfoPhase > 2.0 * kPI)
+      mPlateLfoPhase -= 2.0 * kPI;
 
     double in = 0.0;
-    for (size_t c = 0; c < numChannels; c++) in += inputs[c][s];
-    if (numChannels > 1) in *= 0.5;
+    for (size_t c = 0; c < numChannels; c++)
+      in += inputs[c][s];
+    if (numChannels > 1)
+      in *= 0.5;
     const double preOut = _ReadWritePreDelay(in);
 
     LPTick(mInputLPState, preOut, bwCoef);
@@ -854,35 +1074,51 @@ void Reverb::_ProcessPlate(DSP_SAMPLE** inputs, const size_t numChannels, const 
     for (int i = 0; i < kInputAPs; i++)
       sig = AllpassTick(mInputAPBuf[i], mInputAPIdx[i], mInputAPLen[i], sig, inDiffCoefs[i]);
 
-    double tankInA = sig + mTank[1].lastOut * decayGain;
-    double tankInB = sig + mTank[0].lastOut * decayGain;
+    const double tankIn[2] = {sig + mTank[1].lastOut * decayGain, sig + mTank[0].lastOut * decayGain};
 
     for (int h = 0; h < 2; h++)
     {
-      double tankIn = (h == 0) ? tankInA : tankInB;
-
-      double apOut = AllpassTick(mTank[h].apBuf, mTank[h].apIdx, mTank[h].apLen, tankIn, decayDiff);
-
+      TankHalf& t = mTank[h];
       const double mod = std::sin(mPlateLfoPhase + h * kPI) * modDepth;
-      double readPos = static_cast<double>(mTank[h].delIdx) - static_cast<double>(mTank[h].delLen) - mod;
-      const size_t bufSz = mTank[h].delBuf.size();
-      while (readPos < 0.0) readPos += bufSz;
-      const size_t i0 = static_cast<size_t>(readPos) % bufSz;
-      const size_t i1 = (i0 + 1) % bufSz;
-      const double frac = readPos - std::floor(readPos);
-      const double delOut = mTank[h].delBuf[i0] * (1.0 - frac) + mTank[h].delBuf[i1] * frac;
 
-      mTank[h].delBuf[mTank[h].delIdx] = apOut;
-      mTank[h].delIdx = (mTank[h].delIdx + 1) % bufSz;
+      double x = ModulatedAllpassTick(t.apBuf, t.apIdx, t.apLen, tankIn[h], decayDiff1, mod);
 
-      LPTick(mTank[h].lpState, delOut, dampCoef);
-      mTank[h].lastOut = mTank[h].lpState;
+      const size_t d1Sz = t.delBuf.size();
+      const double d1 = t.delBuf[(t.delIdx + d1Sz - t.delLen) % d1Sz];
+      t.delBuf[t.delIdx] = x;
+      t.delIdx = (t.delIdx + 1) % d1Sz;
+
+      LPTick(t.lpState, d1, dampCoef);
+
+      x = AllpassTick(t.ap2Buf, t.ap2Idx, t.ap2Len, t.lpState, decayDiff2);
+
+      const size_t d2Sz = t.del2Buf.size();
+      const double d2 = t.del2Buf[(t.del2Idx + d2Sz - t.del2Len) % d2Sz];
+      t.del2Buf[t.del2Idx] = x;
+      t.del2Idx = (t.del2Idx + 1) % d2Sz;
+
+      t.lastOut = d2;
     }
 
-    const double outL = mTank[0].lastOut * 0.6 + mTank[1].lastOut * 0.4;
-    const double outR = mTank[1].lastOut * 0.6 + mTank[0].lastOut * 0.4;
+    // Four taps from the far half, three from the near one. This is where the stereo
+    // image comes from; panning one half hard left and the other right, as 1.2.0 did,
+    // cannot produce one when both halves are the same length.
+    const TankHalf& a = mTank[0];
+    const TankHalf& b = mTank[1];
+    const double outL =
+      tapGain
+      * (ReadBufAt(b.delBuf, b.delIdx, mPlateTapL[0]) + ReadBufAt(b.delBuf, b.delIdx, mPlateTapL[1])
+         - ReadBufAt(b.ap2Buf, b.ap2Idx, mPlateTapL[2]) + ReadBufAt(b.del2Buf, b.del2Idx, mPlateTapL[3])
+         - ReadBufAt(a.delBuf, a.delIdx, mPlateTapL[4]) - ReadBufAt(a.ap2Buf, a.ap2Idx, mPlateTapL[5])
+         - ReadBufAt(a.del2Buf, a.del2Idx, mPlateTapL[6]));
+    const double outR =
+      tapGain
+      * (ReadBufAt(a.delBuf, a.delIdx, mPlateTapR[0]) + ReadBufAt(a.delBuf, a.delIdx, mPlateTapR[1])
+         - ReadBufAt(a.ap2Buf, a.ap2Idx, mPlateTapR[2]) + ReadBufAt(a.del2Buf, a.del2Idx, mPlateTapR[3])
+         - ReadBufAt(b.delBuf, b.delIdx, mPlateTapR[4]) - ReadBufAt(b.ap2Buf, b.ap2Idx, mPlateTapR[5])
+         - ReadBufAt(b.del2Buf, b.del2Idx, mPlateTapR[6]));
 
-    // Equal-power crossfade (see Hall comment for rationale).
+    // Equal-power crossfade; see the Hall comment for the rationale.
     mMixSmoothed += (mMix - mMixSmoothed) * mMixSmoothCoef;
     const double angle = mMixSmoothed * (kPI * 0.5);
     const double dryCoef = std::cos(angle);
@@ -892,7 +1128,11 @@ void Reverb::_ProcessPlate(DSP_SAMPLE** inputs, const size_t numChannels, const 
     {
       const double wet = (c == 0) ? outL : outR;
       double final_ = inputs[c][s] * dryCoef + wet * wetCoef;
-      if (std::isnan(final_) || std::isinf(final_)) { final_ = 0.0; Reset(); }
+      if (std::isnan(final_) || std::isinf(final_))
+      {
+        final_ = 0.0;
+        Reset();
+      }
       mOutputs[c][s] = static_cast<DSP_SAMPLE>(final_);
     }
   }
