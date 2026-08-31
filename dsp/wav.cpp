@@ -8,6 +8,7 @@
 #include <cstdint>
 #include <cstring> // strncmp
 #include <cmath> // pow
+#include <filesystem>
 #include <fstream>
 #include <iostream>
 #include <string>
@@ -362,8 +363,15 @@ dsp::wav::LoadReturnCode ReadDataChunk(std::ifstream& wavFile, WaveFileData& wfd
 dsp::wav::LoadReturnCode dsp::wav::Load(const char* fileName, std::vector<float>& audio, double& sampleRate)
 {
   // FYI: https://www.mmsp.ece.mcgill.ca/Documents/AudioFormats/WAVE/WAVE.html
-  // Open the WAV file for reading
-  std::ifstream wavFile(fileName, std::ios::binary);
+  // Open the WAV file for reading. `fileName` is UTF-8; constructing ifstream from
+  // a narrow path uses the ANSI code page on Windows and fails for Unicode paths
+  // (sdatkinson/AudioDSPTools#25). Open via a filesystem path instead.
+#ifdef __cpp_char8_t
+  const auto filePath = std::filesystem::path(reinterpret_cast<const char8_t*>(fileName));
+#else
+  const auto filePath = std::filesystem::u8path(fileName);
+#endif
+  std::ifstream wavFile(filePath, std::ios::binary);
 
   // Check if the file was opened successfully
   if (!wavFile.is_open())
