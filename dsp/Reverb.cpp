@@ -974,8 +974,8 @@ void Reverb::_ProcessOktaverb(DSP_SAMPLE** inputs, const size_t numChannels, con
     //      contribution can never sum to more than half-level on top of dry.
     //   2. tanh on the wet bus to keep wet-gain / FDN / pitch-feedback buildup
     //      bounded below +-1.0. Bloom skips this wet-bus tanh so the swell remains open.
-    //   3. Final per-channel tanh on the dry+wet sum to prevent clipping. Bloom uses
-    //      this same final shoulder when Mix is above zero; Mix=0 remains dry-pass.
+    //   3. Final per-channel tanh on the dry+wet sum to prevent clipping. Every
+    //      sub-mode uses that shoulder when Mix is above zero; Mix=0 is a dry pass.
     // Hall and Plate are untouched and use their original additive Mix in their
     // respective process functions.
     // Equal-power crossfade on the user-Mix angle. The 50% cap bounds the angle so user
@@ -993,7 +993,9 @@ void Reverb::_ProcessOktaverb(DSP_SAMPLE** inputs, const size_t numChannels, con
       const double rawWet = (c == 0) ? outL : outR;
       const double wet = sm.bloom ? rawWet : SoftSaturate(rawWet);
       double mixed = inputs[c][s] * dryCoef + wet * wetCoef;
-      double final_ = (sm.bloom && mMix <= 0.0) ? mixed : SoftSaturate(mixed);
+      // Exact dry sample, not the smoothed crossfade: a Mix of 0 must not tanh
+      // the guitar in Halo or Shimmer, and must not keep a wet tail in Bloom.
+      double final_ = (mMix <= 0.0) ? inputs[c][s] : SoftSaturate(mixed);
       if (std::isnan(final_) || std::isinf(final_))
       {
         final_ = 0.0;
