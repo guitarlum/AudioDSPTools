@@ -60,16 +60,18 @@ private:
   void _ProcessOktaverb(DSP_SAMPLE** inputs, const size_t numChannels, const size_t numFrames);
 
   // Input diffusion shared by the FDN modes, and the early taps that give them wet
-  // energy before the shortest delay line can produce any.
-  double _DiffuseFdnInput(double input);
-  void _FdnEarlyField(double diffused, double& outL, double& outR);
+  // energy before the shortest delay line can produce any. `side` 0 is the left input,
+  // 1 the right.
+  double _DiffuseFdnInput(int side, double input);
+  void _FdnEarlyField(double diffusedL, double diffusedR, double& outL, double& outR);
 
   void _AllocateHall();
   void _AllocatePlate();
   void _AllocateOktaverb();
   void _AllocatePreDelay();
   void _SetPreDelayLength(double preDelayMs);
-  double _ReadWritePreDelay(double input);
+  // Delays both sides in place.
+  void _ReadWritePreDelay(double& left, double& right);
   // Generic grain-based pitch shifter; ratio > 1 = pitch up, ratio < 1 = pitch down.
   // 'voice' indexes separate grain buffers so feedback octave-up, feedback octave-down, and
   // parallel sub-fifth paths never share state.
@@ -115,9 +117,15 @@ private:
   // tank is excited by a bare impulse, so the first pass through the eight lines came
   // out as eight separate clicks instead of a dense burst. Plate keeps its own
   // Dattorro input diffusers; these are separate buffers so the two never share state.
+  //
+  // The input is true stereo: one diffuser per side, left feeding the lines the left
+  // output reads and right the others. Summing the sides to mono in front of one
+  // diffuser, as this did before 1.3.0, let a Dual Amp pair in anti-phase cancel before
+  // the tank heard it. Both sides share lengths and coefficients, so for L == R they
+  // compute exactly what the single diffuser did.
   static const int kFdnDiffusers = 4;
-  std::vector<std::vector<double>> mFdnAPBuf;
-  std::vector<size_t> mFdnAPIdx;
+  std::vector<std::vector<double>> mFdnAPBuf[2];
+  std::vector<size_t> mFdnAPIdx[2];
   std::vector<size_t> mFdnAPLen;
 
   // The early field, which is the diffuser output taken through one more allpass per
@@ -147,10 +155,12 @@ private:
   double mBloomEnv = 0.0;
   double mBloomVCA = 0.0;
 
-  // Plate (Dattorro)
+  // Plate (Dattorro). Input bandwidth filter and diffusers per side, like the FDN
+  // diffuser above: left drives tank half 1, whose taps lead the left output, and right
+  // drives half 0.
   static const int kInputAPs = 4;
-  std::vector<std::vector<double>> mInputAPBuf;
-  std::vector<size_t> mInputAPIdx;
+  std::vector<std::vector<double>> mInputAPBuf[2];
+  std::vector<size_t> mInputAPIdx[2];
   std::vector<size_t> mInputAPLen;
 
   // Tank: 2 halves. Each half is decay-diffusion-1 -> delay -> damping ->
@@ -188,12 +198,12 @@ private:
 
   double mPlateLfoPhase = 0.0;
 
-  // Shared pre-delay
-  std::vector<double> mPreDelayBuf;
+  // Shared pre-delay, one line per side on a common write head.
+  std::vector<double> mPreDelayBuf[2];
   size_t mPreDelayIdx = 0;
   size_t mPreDelayLen = 0;
 
-  double mInputLPState = 0.0;
+  double mInputLPState[2] = {0.0, 0.0};
 
   bool mHallAllocated = false;
   bool mPlateAllocated = false;

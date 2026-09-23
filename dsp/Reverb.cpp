@@ -187,12 +187,14 @@ Reverb::Reverb()
   mHallLPState.resize(kHallLines, 0.0);
   mHallChorusPhase.resize(kHallLines, 0.0);
 
-  mInputAPBuf.resize(kInputAPs);
-  mInputAPIdx.resize(kInputAPs, 0);
+  for (int side = 0; side < 2; side++)
+  {
+    mInputAPBuf[side].resize(kInputAPs);
+    mInputAPIdx[side].resize(kInputAPs, 0);
+    mFdnAPBuf[side].resize(kFdnDiffusers);
+    mFdnAPIdx[side].resize(kFdnDiffusers, 0);
+  }
   mInputAPLen.resize(kInputAPs, 0);
-
-  mFdnAPBuf.resize(kFdnDiffusers);
-  mFdnAPIdx.resize(kFdnDiffusers, 0);
   mFdnAPLen.resize(kFdnDiffusers, 0);
 
   mFdnEarlyAPBuf.resize(kFdnEarlyAPs);
@@ -228,7 +230,7 @@ void Reverb::Prepare(const size_t numChannels, const size_t numFrames, double sa
     mOktaverbAllocated = false;
     _AllocatePreDelay();
   }
-  else if (mPreDelayBuf.empty())
+  else if (mPreDelayBuf[0].empty())
   {
     _AllocatePreDelay();
   }
@@ -288,7 +290,7 @@ void Reverb::SetParams(double mix, double decay, double tone, double preDelayMs,
     mOktaverbAllocated = false;
     _AllocatePreDelay();
   }
-  else if (mPreDelayBuf.empty())
+  else if (mPreDelayBuf[0].empty())
   {
     _AllocatePreDelay();
   }
@@ -320,7 +322,8 @@ void Reverb::_AllocatePreDelay()
   // Maximum pre-delay extended to 200 ms to support Oktaverb's pitched bloom.
   const size_t maxPreDelayLen = ScaleDelay(200.0, mSampleRate);
   mPreDelayLen = static_cast<size_t>(mPreDelayMs * mSampleRate / 1000.0);
-  mPreDelayBuf.assign(maxPreDelayLen + 4, 0.0);
+  for (auto& buf : mPreDelayBuf)
+    buf.assign(maxPreDelayLen + 4, 0.0);
   mPreDelayIdx = 0;
 }
 
@@ -328,8 +331,8 @@ void Reverb::_SetPreDelayLength(double preDelayMs)
 {
   mPreDelayMs = preDelayMs;
   mPreDelayLen = static_cast<size_t>(mPreDelayMs * mSampleRate / 1000.0);
-  if (!mPreDelayBuf.empty() && mPreDelayLen >= mPreDelayBuf.size())
-    mPreDelayLen = mPreDelayBuf.size() - 1;
+  if (!mPreDelayBuf[0].empty() && mPreDelayLen >= mPreDelayBuf[0].size())
+    mPreDelayLen = mPreDelayBuf[0].size() - 1;
 }
 
 void Reverb::_AllocateHall()
@@ -356,8 +359,11 @@ void Reverb::_AllocateHall()
   for (int i = 0; i < kFdnDiffusers; i++)
   {
     mFdnAPLen[i] = ScaleDelay(fdnDiffuserMs[i], mSampleRate);
-    mFdnAPBuf[i].assign(mFdnAPLen[i] + 16, 0.0);
-    mFdnAPIdx[i] = 0;
+    for (int side = 0; side < 2; side++)
+    {
+      mFdnAPBuf[side][i].assign(mFdnAPLen[i] + 16, 0.0);
+      mFdnAPIdx[side][i] = 0;
+    }
   }
 
   // One more allpass per output channel, longer than any in the shared chain and
@@ -409,8 +415,11 @@ void Reverb::_AllocatePlate()
   for (int i = 0; i < kInputAPs; i++)
   {
     mInputAPLen[i] = ScaleFromRef(inputAPRef[i], refSR, mSampleRate);
-    mInputAPBuf[i].assign(mInputAPLen[i] + 16, 0.0);
-    mInputAPIdx[i] = 0;
+    for (int side = 0; side < 2; side++)
+    {
+      mInputAPBuf[side][i].assign(mInputAPLen[i] + 16, 0.0);
+      mInputAPIdx[side][i] = 0;
+    }
   }
 
   const size_t tankAPRef[2] = {672, 908};
@@ -456,7 +465,7 @@ void Reverb::_AllocatePlate()
     mPlateTapR[t] = ScaleFromRef(tapRRef[t], refSR, mSampleRate);
   }
 
-  mInputLPState = 0.0;
+  mInputLPState[0] = mInputLPState[1] = 0.0;
   mPlateLfoPhase = 0.0;
   mPlateAllocated = true;
 }
@@ -470,15 +479,18 @@ void Reverb::Reset()
     mHallLPState[i] = 0.0;
     mHallChorusPhase[i] = 0.0;
   }
-  for (int i = 0; i < kInputAPs; i++)
+  for (int side = 0; side < 2; side++)
   {
-    std::fill(mInputAPBuf[i].begin(), mInputAPBuf[i].end(), 0.0);
-    mInputAPIdx[i] = 0;
-  }
-  for (int i = 0; i < kFdnDiffusers; i++)
-  {
-    std::fill(mFdnAPBuf[i].begin(), mFdnAPBuf[i].end(), 0.0);
-    mFdnAPIdx[i] = 0;
+    for (int i = 0; i < kInputAPs; i++)
+    {
+      std::fill(mInputAPBuf[side][i].begin(), mInputAPBuf[side][i].end(), 0.0);
+      mInputAPIdx[side][i] = 0;
+    }
+    for (int i = 0; i < kFdnDiffusers; i++)
+    {
+      std::fill(mFdnAPBuf[side][i].begin(), mFdnAPBuf[side][i].end(), 0.0);
+      mFdnAPIdx[side][i] = 0;
+    }
   }
   for (int i = 0; i < kFdnEarlyAPs; i++)
   {
@@ -498,7 +510,8 @@ void Reverb::Reset()
     mTank[h].lpState = 0.0;
     mTank[h].lastOut = 0.0;
   }
-  std::fill(mPreDelayBuf.begin(), mPreDelayBuf.end(), 0.0);
+  for (auto& buf : mPreDelayBuf)
+    std::fill(buf.begin(), buf.end(), 0.0);
   mPreDelayIdx = 0;
   for (int v = 0; v < kNumPitchVoices; v++)
     for (int i = 0; i < kHallLines; i++)
@@ -516,7 +529,7 @@ void Reverb::Reset()
   }
   mBloomEnv = 0.0;
   mBloomVCA = 0.0;
-  mInputLPState = 0.0;
+  mInputLPState[0] = mInputLPState[1] = 0.0;
   mHallLfoPhase = 0.0;
   mPlateLfoPhase = 0.0;
   mMixSmoothed = mMix;
@@ -546,36 +559,49 @@ DSP_SAMPLE** Reverb::Process(DSP_SAMPLE** inputs, const size_t numChannels, cons
 // decaying series of its own, so by the time the signal reaches the delay lines it is
 // already a burst rather than a spike, and the eight line reads overlap into something
 // continuous instead of arriving as eight separate events.
-double Reverb::_DiffuseFdnInput(double input)
+double Reverb::_DiffuseFdnInput(int side, double input)
 {
   static const double coefs[kFdnDiffusers] = {0.75, 0.75, 0.625, 0.625};
   double sig = input;
   for (int i = 0; i < kFdnDiffusers; i++)
-    sig = AllpassTick(mFdnAPBuf[i], mFdnAPIdx[i], mFdnAPLen[i], sig, coefs[i]);
+    sig = AllpassTick(mFdnAPBuf[side][i], mFdnAPIdx[side][i], mFdnAPLen[i], sig, coefs[i]);
   return sig;
 }
 
-// The early field. Both channels are the diffuser output taken one allpass further,
-// which spreads it over another few tens of milliseconds without touching its
+// The early field. Each channel is its own side's diffuser output taken one allpass
+// further, which spreads it over another few tens of milliseconds without touching its
 // magnitude response, and differently for each channel.
-void Reverb::_FdnEarlyField(double diffused, double& outL, double& outR)
+void Reverb::_FdnEarlyField(double diffusedL, double diffusedR, double& outL, double& outR)
 {
-  outL = AllpassTick(mFdnEarlyAPBuf[0], mFdnEarlyAPIdx[0], mFdnEarlyAPLen[0], diffused, 0.6);
-  outR = AllpassTick(mFdnEarlyAPBuf[1], mFdnEarlyAPIdx[1], mFdnEarlyAPLen[1], diffused, 0.6);
+  outL = AllpassTick(mFdnEarlyAPBuf[0], mFdnEarlyAPIdx[0], mFdnEarlyAPLen[0], diffusedL, 0.6);
+  outR = AllpassTick(mFdnEarlyAPBuf[1], mFdnEarlyAPIdx[1], mFdnEarlyAPLen[1], diffusedR, 0.6);
 }
 
-double Reverb::_ReadWritePreDelay(double input)
+void Reverb::_ReadWritePreDelay(double& left, double& right)
 {
-  if (mPreDelayBuf.empty())
-    return input;
+  if (mPreDelayBuf[0].empty())
+    return;
   if (mPreDelayLen == 0)
-    return input;
+    return;
 
-  const size_t readIdx = (mPreDelayIdx + mPreDelayBuf.size() - mPreDelayLen) % mPreDelayBuf.size();
-  const double out = mPreDelayBuf[readIdx];
-  mPreDelayBuf[mPreDelayIdx] = input;
-  mPreDelayIdx = (mPreDelayIdx + 1) % mPreDelayBuf.size();
-  return out;
+  const size_t sz = mPreDelayBuf[0].size();
+  const size_t readIdx = (mPreDelayIdx + sz - mPreDelayLen) % sz;
+  const double outL = mPreDelayBuf[0][readIdx];
+  const double outR = mPreDelayBuf[1][readIdx];
+  mPreDelayBuf[0][mPreDelayIdx] = left;
+  mPreDelayBuf[1][mPreDelayIdx] = right;
+  mPreDelayIdx = (mPreDelayIdx + 1) % sz;
+  left = outL;
+  right = outR;
+}
+
+// The two sides the tank is fed from. A mono bus feeds both from its one channel,
+// which is exactly what the mono sum gave it; channels past the second are left out of
+// the tank, as a stereo reverb has only two inputs.
+static void ReverbInputSides(DSP_SAMPLE** inputs, const size_t numChannels, const size_t s, double& left, double& right)
+{
+  left = inputs[0][s];
+  right = numChannels > 1 ? static_cast<double>(inputs[1][s]) : left;
 }
 
 double Reverb::_PitchShiftTick(int voice, int line, double input, double ratio)
@@ -674,6 +700,12 @@ void Reverb::_ProcessHall(DSP_SAMPLE** inputs, const size_t numChannels, const s
   //
   // Together those turn the first pass from eight audible clicks into a continuous
   // early field, and they take the hidden 52.7 ms floor out from under PRE-DLY.
+  //
+  // Each input side has its own pre-delay line and diffuser. Left feeds the even lines
+  // and the left early field, which is what the left output taps read; right feeds the
+  // odd lines and the right early field. The Hadamard feedback then spreads both sides
+  // across the whole tank, so an anti-phase pair builds the same tail an in-phase one
+  // does instead of cancelling in a mono sum.
   const HallSubModeChar sm = GetHallSubMode(2);
 
   size_t effLengths[kHallLines];
@@ -721,17 +753,16 @@ void Reverb::_ProcessHall(DSP_SAMPLE** inputs, const size_t numChannels, const s
     if (mHallLfoPhase > 2.0 * kPI)
       mHallLfoPhase -= 2.0 * kPI;
 
-    double in = 0.0;
-    for (size_t c = 0; c < numChannels; c++)
-      in += inputs[c][s];
-    if (numChannels > 1)
-      in *= 0.5;
-    in = _ReadWritePreDelay(in);
-    const double diffused = _DiffuseFdnInput(in);
+    double inL = 0.0;
+    double inR = 0.0;
+    ReverbInputSides(inputs, numChannels, s, inL, inR);
+    _ReadWritePreDelay(inL, inR);
+    const double diffusedL = _DiffuseFdnInput(0, inL);
+    const double diffusedR = _DiffuseFdnInput(1, inR);
 
     double earlyL = 0.0;
     double earlyR = 0.0;
-    _FdnEarlyField(diffused, earlyL, earlyR);
+    _FdnEarlyField(diffusedL, diffusedR, earlyL, earlyR);
 
     double readVals[8];
     for (int i = 0; i < kHallLines; i++)
@@ -764,6 +795,7 @@ void Reverb::_ProcessHall(DSP_SAMPLE** inputs, const size_t numChannels, const s
       double fb = 0.0;
       for (int j = 0; j < kHallLines; j++)
         fb += mixMat[i][j] * readVals[j];
+      const double diffused = (i & 1) ? diffusedR : diffusedL;
       double write = diffused * 0.5 * injectSign[i] + fb;
       if (!std::isfinite(write))
       {
@@ -811,8 +843,8 @@ void Reverb::_ProcessOktaverb(DSP_SAMPLE** inputs, const size_t numChannels, con
   // Oktaverb runs the same FDN as Hall at the unscaled length set, so it had the same
   // bare first pass - eight discrete taps between 31 and 89 ms - just less obvious,
   // because the taps sit closer together and the pitch grains smear everything after
-  // the first generation. It takes Hall's input stage: diffuser, balanced injection and
-  // early taps. Everything downstream of the tank write is unchanged.
+  // the first generation. It takes Hall's input stage: per-side diffusers, balanced
+  // injection and early taps. Everything downstream of the tank write is unchanged.
   static const double injectSign[kHallLines] = {1.0, 1.0, -1.0, 1.0, -1.0, -1.0, 1.0, -1.0};
   const double earlyGain = 0.15;
 
@@ -859,17 +891,16 @@ void Reverb::_ProcessOktaverb(DSP_SAMPLE** inputs, const size_t numChannels, con
 
   for (size_t s = 0; s < numFrames; s++)
   {
-    double in = 0.0;
-    for (size_t c = 0; c < numChannels; c++)
-      in += inputs[c][s];
-    if (numChannels > 1)
-      in *= 0.5;
-    in = _ReadWritePreDelay(in);
-    const double tankSource = _DiffuseFdnInput(in);
+    double inL = 0.0;
+    double inR = 0.0;
+    ReverbInputSides(inputs, numChannels, s, inL, inR);
+    _ReadWritePreDelay(inL, inR);
+    const double tankSourceL = _DiffuseFdnInput(0, inL);
+    const double tankSourceR = _DiffuseFdnInput(1, inR);
 
     double earlyL = 0.0;
     double earlyR = 0.0;
-    _FdnEarlyField(tankSource, earlyL, earlyR);
+    _FdnEarlyField(tankSourceL, tankSourceR, earlyL, earlyR);
 
     double readVals[8];
     double parallelPitchVals[8];
@@ -901,7 +932,8 @@ void Reverb::_ProcessOktaverb(DSP_SAMPLE** inputs, const size_t numChannels, con
       }
     }
 
-    const double absIn = std::abs(in);
+    // The louder side, so the swell opens for an anti-phase pair or a hard-panned amp.
+    const double absIn = std::max(std::abs(inL), std::abs(inR));
     LPTick(mBloomEnv, absIn, absIn > mBloomEnv ? bloomEnvAttackCoef : bloomEnvReleaseCoef);
     const double bloomTarget = (mBloomEnv > 0.0001 || mBloomVCA > 0.0001) ? 1.0 : 0.0;
     LPTick(mBloomVCA, bloomTarget, bloomTarget > mBloomVCA ? bloomAttackCoef : bloomReleaseCoef);
@@ -940,6 +972,7 @@ void Reverb::_ProcessOktaverb(DSP_SAMPLE** inputs, const size_t numChannels, con
         pitched -= lowRumble;
         fb += std::clamp(pitched, -0.65, 0.65);
       }
+      const double tankSource = (i & 1) ? tankSourceR : tankSourceL;
       double tankIn = sm.bloom ? tankSource : tankSource * sm.inputGain;
       tankIn *= injectSign[i];
       double write = tankIn + fb;
@@ -1063,20 +1096,24 @@ void Reverb::_ProcessPlate(DSP_SAMPLE** inputs, const size_t numChannels, const 
     if (mPlateLfoPhase > 2.0 * kPI)
       mPlateLfoPhase -= 2.0 * kPI;
 
-    double in = 0.0;
-    for (size_t c = 0; c < numChannels; c++)
-      in += inputs[c][s];
-    if (numChannels > 1)
-      in *= 0.5;
-    const double preOut = _ReadWritePreDelay(in);
+    double inL = 0.0;
+    double inR = 0.0;
+    ReverbInputSides(inputs, numChannels, s, inL, inR);
+    _ReadWritePreDelay(inL, inR);
 
-    LPTick(mInputLPState, preOut, bwCoef);
-    double sig = mInputLPState;
+    // Dattorro's input chain once per side. Left enters half 1, whose delay lines carry
+    // the left output's four leading taps, and right enters half 0; the cross-coupled
+    // loop carries each into the other half on the next pass.
+    double sig[2] = {inL, inR};
+    for (int side = 0; side < 2; side++)
+    {
+      LPTick(mInputLPState[side], sig[side], bwCoef);
+      sig[side] = mInputLPState[side];
+      for (int i = 0; i < kInputAPs; i++)
+        sig[side] = AllpassTick(mInputAPBuf[side][i], mInputAPIdx[side][i], mInputAPLen[i], sig[side], inDiffCoefs[i]);
+    }
 
-    for (int i = 0; i < kInputAPs; i++)
-      sig = AllpassTick(mInputAPBuf[i], mInputAPIdx[i], mInputAPLen[i], sig, inDiffCoefs[i]);
-
-    const double tankIn[2] = {sig + mTank[1].lastOut * decayGain, sig + mTank[0].lastOut * decayGain};
+    const double tankIn[2] = {sig[1] + mTank[1].lastOut * decayGain, sig[0] + mTank[0].lastOut * decayGain};
 
     for (int h = 0; h < 2; h++)
     {
