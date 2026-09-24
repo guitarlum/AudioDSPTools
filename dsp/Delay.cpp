@@ -41,6 +41,12 @@ inline double ReadFractional(const std::vector<double>& buf, size_t writeIndex, 
   return buf[idx1] * (1.0 - frac) + buf[idx2] * frac;
 }
 
+// Only called with at least two channels. Summed in double: 0.5 * (x + x) == x exactly.
+inline double PingPongSeed(DSP_SAMPLE** inputs, size_t s)
+{
+  return 0.5 * (static_cast<double>(inputs[0][s]) + static_cast<double>(inputs[1][s]));
+}
+
 } // namespace
 
 Delay::Delay()
@@ -257,12 +263,13 @@ DSP_SAMPLE** Delay::_ProcessDigital(DSP_SAMPLE** inputs, const size_t numChannel
 
       // Ping-pong: opposite-channel read into feedback; seed right delay line only so L=R mono
       // still produces R-first alternating repeats (cross-feed fills left on later taps).
+      // The seed is the L/R mid so a right-panned source echoes too; for L == R it is L exactly.
       double feedbackSrc;
       double writeInput;
       if (mPingPong && numChannels > 1 && c < 2)
       {
         feedbackSrc = readOther;
-        writeInput = (c == 1) ? static_cast<double>(inputs[0][s]) : 0.0;
+        writeInput = (c == 1) ? PingPongSeed(inputs, s) : 0.0;
       }
       else
       {
@@ -351,7 +358,7 @@ DSP_SAMPLE** Delay::_ProcessAnalog(DSP_SAMPLE** inputs, const size_t numChannels
       if (mPingPong && numChannels > 1 && c < 2)
       {
         feedbackSrcBase = readBase[1 - c];
-        writeInput = (c == 1) ? static_cast<double>(inputs[0][s]) : 0.0;
+        writeInput = (c == 1) ? PingPongSeed(inputs, s) : 0.0;
       }
       else
       {
