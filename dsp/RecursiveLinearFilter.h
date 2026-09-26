@@ -30,6 +30,9 @@ protected:
   size_t _GetOutputDegree() const { return this->mOutputCoefficients.size(); };
   // Additionally prepares mInputHistory and mOutputHistory.
   void _PrepareBuffers(const size_t numChannels, const size_t numFrames) override;
+  // VoLum: Process() through the any-degree loop, skipping the fixed-degree kernels. Same output bits and
+  // history state as Process(); kept as the reference the kernels are tested against.
+  DSP_SAMPLE** _ProcessGeneric(DSP_SAMPLE** inputs, const size_t numChannels, const size_t numFrames);
 
   // Coefficients for the DSP filter
   // [0] is for the current sample
@@ -49,6 +52,12 @@ protected:
   // Designates which index is currently "0". Use modulus to wrap around.
   long mInputStart;
   long mOutputStart;
+
+private:
+  void _ProcessAnyDegree(DSP_SAMPLE** inputs, const size_t numChannels, const size_t numFrames);
+  // VoLum: the any-degree loop unrolled for one (input, output) degree pair.
+  template <long InputDegree, long OutputDegree>
+  void _ProcessFixedDegree(DSP_SAMPLE** inputs, const size_t numChannels, const size_t numFrames);
 };
 
 class LevelParams : public dsp::Params

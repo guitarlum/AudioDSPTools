@@ -22,10 +22,136 @@ mOutputStart(outputDegree)
   this->mOutputCoefficients.resize(outputDegree);
 }
 
+namespace
+{
+// VoLum: the ring slot after `index`, for an index already in [0, Degree). Replaces `% Degree`.
+template <long Degree>
+inline long NextRingIndex(const long index)
+{
+  return index + 1 == Degree ? 0 : index + 1;
+}
+} // namespace
+
+// VoLum: each term stays its own `out +=` statement in the any-degree loop's order (input terms current ->
+// oldest, then output terms newest -> oldest, starting from 0.0), so a compiler that contracts `out += c * x`
+// into an FMA does so identically in both paths. The history rings are written every sample exactly as the
+// any-degree loop writes them; the previous samples are read from registers holding the same values, which
+// keeps the ring's store -> load round trip off the feedback path.
+template <long InputDegree, long OutputDegree>
+void recursive_linear_filter::Base::_ProcessFixedDegree(DSP_SAMPLE** inputs, const size_t numChannels,
+                                                        const size_t numFrames)
+{
+  static_assert(InputDegree >= 1 && InputDegree <= 3, "input terms are written out up to degree 3");
+  static_assert(
+    OutputDegree == 0 || (OutputDegree >= 2 && OutputDegree <= 3), "output terms are written out up to degree 3");
+  const double inputCoefficient0 = this->mInputCoefficients[0];
+  const double inputCoefficient1 = InputDegree > 1 ? this->mInputCoefficients[1] : 0.0;
+  const double inputCoefficient2 = InputDegree > 2 ? this->mInputCoefficients[2] : 0.0;
+  const double outputCoefficient1 = OutputDegree > 1 ? this->mOutputCoefficients[1] : 0.0;
+  const double outputCoefficient2 = OutputDegree > 2 ? this->mOutputCoefficients[2] : 0.0;
+  long inputStart = 0;
+  long outputStart = 0;
+  for (size_t c = 0; c < numChannels; c++)
+  {
+    inputStart = this->mInputStart;
+    outputStart = this->mOutputStart;
+    const DSP_SAMPLE* input = inputs[c];
+    DSP_SAMPLE* output = this->mOutputs[c].data();
+    DSP_SAMPLE* inputHistory = this->mInputHistory[c].data();
+    DSP_SAMPLE* outputHistory = this->mOutputHistory[c].data();
+
+    // x[n-1], x[n-2], y[n-1], y[n-2] for the first sample: the ring slots it would read.
+    DSP_SAMPLE input1 = 0.0, input2 = 0.0, output1 = 0.0, output2 = 0.0;
+    if (InputDegree > 1)
+    {
+      long first = inputStart - 1;
+      if (first < 0)
+        first = InputDegree - 1;
+      const long slot1 = NextRingIndex<InputDegree>(first);
+      input1 = inputHistory[slot1];
+      if (InputDegree > 2)
+        input2 = inputHistory[NextRingIndex<InputDegree>(slot1)];
+    }
+    if (OutputDegree > 1)
+    {
+      long first = outputStart - 1;
+      if (first < 0)
+        first = OutputDegree - 1;
+      const long slot1 = NextRingIndex<OutputDegree>(first);
+      output1 = outputHistory[slot1];
+      if (OutputDegree > 2)
+        output2 = outputHistory[NextRingIndex<OutputDegree>(slot1)];
+    }
+
+    for (size_t s = 0; s < numFrames; s++)
+    {
+      DSP_SAMPLE out = 0.0;
+      inputStart -= 1;
+      if (inputStart < 0)
+        inputStart = InputDegree - 1;
+      const DSP_SAMPLE input0 = input[s];
+      inputHistory[inputStart] = input0;
+      out += inputCoefficient0 * input0;
+      if (InputDegree > 1)
+        out += inputCoefficient1 * input1;
+      if (InputDegree > 2)
+        out += inputCoefficient2 * input2;
+
+      outputStart -= 1;
+      if (outputStart < 0)
+        outputStart = OutputDegree - 1;
+      if (OutputDegree > 1)
+        out += outputCoefficient1 * output1;
+      if (OutputDegree > 2)
+        out += outputCoefficient2 * output2;
+      if (std::isnan(out))
+        out = 0.0;
+      if (OutputDegree >= 1)
+        outputHistory[outputStart] = out;
+      output[s] = out;
+
+      input2 = input1;
+      input1 = input0;
+      output2 = output1;
+      output1 = out;
+    }
+  }
+  this->mInputStart = inputStart;
+  this->mOutputStart = outputStart;
+}
+
 DSP_SAMPLE** recursive_linear_filter::Base::Process(DSP_SAMPLE** inputs, const size_t numChannels,
                                                     const size_t numFrames)
 {
   this->_PrepareBuffers(numChannels, numFrames);
+  // VoLum: every filter VoLum runs has one of these degree pairs (Biquad, HighPass, LowPass, Level). The
+  // kernels leave the output bits and the history rings exactly as the any-degree loop would.
+  const size_t inputDegree = this->_GetInputDegree();
+  const size_t outputDegree = this->_GetOutputDegree();
+  if (inputDegree == 3 && outputDegree == 3)
+    this->_ProcessFixedDegree<3, 3>(inputs, numChannels, numFrames);
+  else if (inputDegree == 2 && outputDegree == 2)
+    this->_ProcessFixedDegree<2, 2>(inputs, numChannels, numFrames);
+  else if (inputDegree == 1 && outputDegree == 2)
+    this->_ProcessFixedDegree<1, 2>(inputs, numChannels, numFrames);
+  else if (inputDegree == 1 && outputDegree == 0)
+    this->_ProcessFixedDegree<1, 0>(inputs, numChannels, numFrames);
+  else
+    this->_ProcessAnyDegree(inputs, numChannels, numFrames);
+  return this->_GetPointers();
+}
+
+DSP_SAMPLE** recursive_linear_filter::Base::_ProcessGeneric(DSP_SAMPLE** inputs, const size_t numChannels,
+                                                            const size_t numFrames)
+{
+  this->_PrepareBuffers(numChannels, numFrames);
+  this->_ProcessAnyDegree(inputs, numChannels, numFrames);
+  return this->_GetPointers();
+}
+
+void recursive_linear_filter::Base::_ProcessAnyDegree(DSP_SAMPLE** inputs, const size_t numChannels,
+                                                      const size_t numFrames)
+{
   long inputStart = 0;
   long outputStart = 0;
   // Degree = longest history
@@ -67,7 +193,6 @@ DSP_SAMPLE** recursive_linear_filter::Base::Process(DSP_SAMPLE** inputs, const s
   }
   this->mInputStart = inputStart;
   this->mOutputStart = outputStart;
-  return this->_GetPointers();
 }
 
 void recursive_linear_filter::Base::_PrepareBuffers(const size_t numChannels, const size_t numFrames)
