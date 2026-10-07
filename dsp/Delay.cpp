@@ -41,18 +41,33 @@ inline double ReadFractional(const std::vector<double>& buf, size_t writeIndex, 
   return buf[idx1] * (1.0 - frac) + buf[idx2] * frac;
 }
 
-// Ping-pong seeds the R line with the L/R mid and the L line with the side, so the
-// pair carries the input's energy whatever the L/R relation: a polarity-inverted
-// Dual Amp lane cannot cancel the echoes. Only called with at least two channels.
-// Summed in double: for L == R the mid is L exactly and the side exactly 0.
-inline double PingPongSeed(DSP_SAMPLE** inputs, size_t channel, size_t s)
-{
-  const double l = static_cast<double>(inputs[0][s]);
-  const double r = static_cast<double>(inputs[1][s]);
-  return channel == 1 ? 0.5 * (l + r) : 0.5 * (l - r);
-}
+constexpr double kPingPongCorrelationSeconds = 0.05;
+constexpr double kPingPongFloor = 1.0e-30;
 
 } // namespace
+
+// Ping-pong feeds one mono seed into the R line only, so no echo is ever the
+// opposite polarity of another. A plain L/R mid cancels when R is a polarity-inverted
+// copy of L (Dual Amp's default split), so R's weight follows the running L/R
+// correlation rho: +1 down to rho = -0.25, -1 from rho = -0.75. One-sided,
+// uncorrelated and identical channels all get exactly +1, so L == R seeds exactly L.
+double Delay::_PingPongSeed(double l, double r, double coeff)
+{
+  mPingPongLR += coeff * (l * r - mPingPongLR);
+  mPingPongLL += coeff * (l * l - mPingPongLL);
+  mPingPongRR += coeff * (r * r - mPingPongRR);
+  if (std::abs(mPingPongLR) < kPingPongFloor)
+    mPingPongLR = 0.0;
+  if (mPingPongLL < kPingPongFloor)
+    mPingPongLL = 0.0;
+  if (mPingPongRR < kPingPongFloor)
+    mPingPongRR = 0.0;
+
+  const double norm = std::sqrt(mPingPongLL * mPingPongRR);
+  const double rho = norm > kPingPongFloor ? mPingPongLR / norm : 0.0;
+  const double rWeight = std::clamp(2.0 + 4.0 * rho, -1.0, 1.0);
+  return 0.5 * (l + rWeight * r);
+}
 
 Delay::Delay() {}
 
@@ -117,6 +132,9 @@ void Delay::Reset()
   std::fill(mFeedbackLpState.begin(), mFeedbackLpState.end(), 0.0);
   mChorusPhase = 0.0;
   mCompandEnv = 0.0;
+  mPingPongLR = 0.0;
+  mPingPongLL = 0.0;
+  mPingPongRR = 0.0;
   _ResetReverseState();
 }
 
@@ -230,9 +248,13 @@ DSP_SAMPLE** Delay::_ProcessDigital(DSP_SAMPLE** inputs, const size_t numChannel
     return (static_cast<double>((noiseSeed >> 8) & 0xFFFF) / 65535.0 - 0.5) * 2.0;
   };
 
+  const bool pingPong = mPingPong && numChannels > 1;
+  const double pingPongCoeff = 1.0 - std::exp(-1.0 / (kPingPongCorrelationSeconds * mSampleRate));
+
   for (size_t s = 0; s < numFrames; s++)
   {
     mCurrentDelayFrames += 0.001 * (mTargetDelayFrames - mCurrentDelayFrames);
+    const double pingPongSeed = pingPong ? _PingPongSeed(inputs[0][s], inputs[1][s], pingPongCoeff) : 0.0;
 
     // Read both channels first so ping-pong cross-feed is symmetric.
     double readSample[2] = {0.0, 0.0};
@@ -263,14 +285,14 @@ DSP_SAMPLE** Delay::_ProcessDigital(DSP_SAMPLE** inputs, const size_t numChannel
       }
       mOutputs[c][s] = static_cast<DSP_SAMPLE>(finalSample);
 
-      // Ping-pong: opposite-channel read into feedback. L = R mono seeds only the right
-      // line, so it still produces R-first alternating repeats (cross-feed fills left).
+      // Ping-pong: opposite-channel read into feedback; the seed enters the right line
+      // only, so repeats alternate R-first (cross-feed fills left).
       double feedbackSrc;
       double writeInput;
-      if (mPingPong && numChannels > 1 && c < 2)
+      if (pingPong && c < 2)
       {
         feedbackSrc = readOther;
-        writeInput = PingPongSeed(inputs, c, s);
+        writeInput = c == 1 ? pingPongSeed : 0.0;
       }
       else
       {
@@ -304,10 +326,13 @@ DSP_SAMPLE** Delay::_ProcessAnalog(DSP_SAMPLE** inputs, const size_t numChannels
   // Compander parameters (envelope follower).
   const double compAttack = std::exp(-1.0 / (0.005 * mSampleRate));
   const double compRelease = std::exp(-1.0 / (0.150 * mSampleRate));
+  const bool pingPong = mPingPong && numChannels > 1;
+  const double pingPongCoeff = 1.0 - std::exp(-1.0 / (kPingPongCorrelationSeconds * mSampleRate));
 
   for (size_t s = 0; s < numFrames; s++)
   {
     mCurrentDelayFrames += 0.001 * (mTargetDelayFrames - mCurrentDelayFrames);
+    const double pingPongSeed = pingPong ? _PingPongSeed(inputs[0][s], inputs[1][s], pingPongCoeff) : 0.0;
 
     // LFO tick.
     mChorusPhase += chorusRateHz / mSampleRate;
@@ -359,10 +384,10 @@ DSP_SAMPLE** Delay::_ProcessAnalog(DSP_SAMPLE** inputs, const size_t numChannels
       // Soft saturation in feedback path; intensity rises with feedback.
       double feedbackSrcBase;
       double writeInput;
-      if (mPingPong && numChannels > 1 && c < 2)
+      if (pingPong && c < 2)
       {
         feedbackSrcBase = readBase[1 - c];
-        writeInput = PingPongSeed(inputs, c, s);
+        writeInput = c == 1 ? pingPongSeed : 0.0;
       }
       else
       {

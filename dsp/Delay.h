@@ -39,8 +39,8 @@ public:
   // - tone (0..1): per-mode tilt EQ; 0.5 = flat.
   // - age (0..1): per-mode character control (Digital crusher/noise, Analog BBD darkness/chorus depth,
   //   Reverse fade-shape softness).
-  // - pingPong: stereo cross-feedback toggle (R line seeded with the mid, L line with the side,
-  //   opposite tap feedback). Ignored by Reverse.
+  // - pingPong: stereo cross-feedback toggle (one seed into the R line: L plus R signed by
+  //   the running L/R correlation; opposite tap feedback). Ignored by Reverse.
   void SetParams(double timeMs, double feedback, double mix, int mode, double sampleRate, double tone, double age,
                  bool pingPong);
 
@@ -68,6 +68,9 @@ private:
   double _ApplyToneTilt(size_t channel, double sample, double tone, double cutoffHz);
 
   size_t _GetMaxFrames() const;
+
+  // Ping-pong seed for one frame; updates the running L/R statistics.
+  double _PingPongSeed(double l, double r, double coeff);
 
   double mSampleRate = 0.0;
   double mTimeMs = 380.0;
@@ -115,6 +118,11 @@ private:
 
   // Analog compander (peak follower for write-side compression / read-side expansion).
   double mCompandEnv = 0.0;
+
+  // Ping-pong running L*R, L*L, R*R means.
+  double mPingPongLR = 0.0;
+  double mPingPongLL = 0.0;
+  double mPingPongRR = 0.0;
 };
 
 } // namespace effect
