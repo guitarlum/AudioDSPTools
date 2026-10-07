@@ -39,9 +39,10 @@ public:
   // - tone (0..1): per-mode tilt EQ; 0.5 = flat.
   // - age (0..1): per-mode character control (Digital crusher/noise, Analog BBD darkness/chorus depth,
   //   Reverse fade-shape softness).
-  // - pingPong: stereo cross-feedback toggle (R-line seed + opposite tap feedback). Ignored by Reverse.
-  void SetParams(double timeMs, double feedback, double mix, int mode, double sampleRate,
-                 double tone, double age, bool pingPong);
+  // - pingPong: stereo cross-feedback toggle (R line seeded with the mid, L line with the side,
+  //   opposite tap feedback). Ignored by Reverse.
+  void SetParams(double timeMs, double feedback, double mix, int mode, double sampleRate, double tone, double age,
+                 bool pingPong);
 
   void Reset();
 
@@ -94,9 +95,9 @@ private:
   struct ReverseVoice
   {
     bool active = false;
-    size_t index = 0;       // 0..length-1, position within reversed playback
-    size_t length = 0;      // segmentFrames captured at launch
-    size_t startReadPos = 0;// ring index of the most-recent sample at launch
+    size_t index = 0; // 0..length-1, position within reversed playback
+    size_t length = 0; // segmentFrames captured at launch
+    size_t startReadPos = 0; // ring index of the most-recent sample at launch
   };
   std::vector<std::vector<double>> mReverseRing; // per-channel capture ring
   size_t mReverseRingSize = 0;

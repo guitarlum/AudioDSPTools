@@ -8,7 +8,7 @@
 #include <cmath>
 
 #ifndef M_PI
-#define M_PI 3.14159265358979323846
+  #define M_PI 3.14159265358979323846
 #endif
 
 namespace dsp
@@ -41,17 +41,20 @@ inline double ReadFractional(const std::vector<double>& buf, size_t writeIndex, 
   return buf[idx1] * (1.0 - frac) + buf[idx2] * frac;
 }
 
-// Only called with at least two channels. Summed in double: 0.5 * (x + x) == x exactly.
-inline double PingPongSeed(DSP_SAMPLE** inputs, size_t s)
+// Ping-pong seeds the R line with the L/R mid and the L line with the side, so the
+// pair carries the input's energy whatever the L/R relation: a polarity-inverted
+// Dual Amp lane cannot cancel the echoes. Only called with at least two channels.
+// Summed in double: for L == R the mid is L exactly and the side exactly 0.
+inline double PingPongSeed(DSP_SAMPLE** inputs, size_t channel, size_t s)
 {
-  return 0.5 * (static_cast<double>(inputs[0][s]) + static_cast<double>(inputs[1][s]));
+  const double l = static_cast<double>(inputs[0][s]);
+  const double r = static_cast<double>(inputs[1][s]);
+  return channel == 1 ? 0.5 * (l + r) : 0.5 * (l - r);
 }
 
 } // namespace
 
-Delay::Delay()
-{
-}
+Delay::Delay() {}
 
 void Delay::Prepare(const size_t numChannels, const size_t numFrames, double sampleRate)
 {
@@ -99,8 +102,7 @@ void Delay::SetParams(double timeMs, double feedback, double mix, int mode, doub
   // into the in-flight voice's snapshot. Must be set BEFORE Reset() below so the
   // post-reset launch countdown reflects the new slice length.
   mReverseSegmentFrames = std::clamp<size_t>(
-    static_cast<size_t>(std::round(mTargetDelayFrames)), 2,
-    std::max<size_t>(2, _GetMaxFrames() / 2));
+    static_cast<size_t>(std::round(mTargetDelayFrames)), 2, std::max<size_t>(2, _GetMaxFrames() / 2));
 
   if (prevMode != mMode || prevPingPong != mPingPong)
     Reset();
@@ -261,15 +263,14 @@ DSP_SAMPLE** Delay::_ProcessDigital(DSP_SAMPLE** inputs, const size_t numChannel
       }
       mOutputs[c][s] = static_cast<DSP_SAMPLE>(finalSample);
 
-      // Ping-pong: opposite-channel read into feedback; seed right delay line only so L=R mono
-      // still produces R-first alternating repeats (cross-feed fills left on later taps).
-      // The seed is the L/R mid so a right-panned source echoes too; for L == R it is L exactly.
+      // Ping-pong: opposite-channel read into feedback. L = R mono seeds only the right
+      // line, so it still produces R-first alternating repeats (cross-feed fills left).
       double feedbackSrc;
       double writeInput;
       if (mPingPong && numChannels > 1 && c < 2)
       {
         feedbackSrc = readOther;
-        writeInput = (c == 1) ? PingPongSeed(inputs, s) : 0.0;
+        writeInput = PingPongSeed(inputs, c, s);
       }
       else
       {
@@ -312,7 +313,8 @@ DSP_SAMPLE** Delay::_ProcessAnalog(DSP_SAMPLE** inputs, const size_t numChannels
     mChorusPhase += chorusRateHz / mSampleRate;
     if (mChorusPhase >= 1.0)
       mChorusPhase -= 1.0;
-    const double chorusOffsetFrames = chorusCenterFrames + chorusDepthFrames * 0.5 * std::sin(2.0 * M_PI * mChorusPhase);
+    const double chorusOffsetFrames =
+      chorusCenterFrames + chorusDepthFrames * 0.5 * std::sin(2.0 * M_PI * mChorusPhase);
 
     double readBase[2] = {0.0, 0.0};
     for (size_t c = 0; c < numChannels && c < 2; c++)
@@ -321,7 +323,8 @@ DSP_SAMPLE** Delay::_ProcessAnalog(DSP_SAMPLE** inputs, const size_t numChannels
     for (size_t c = 0; c < numChannels; c++)
     {
       const double inputSample = inputs[c][s];
-      const double readCBase = (c < 2) ? readBase[c] : ReadFractional(mBuffer[c], mWriteIndex, mCurrentDelayFrames, maxFrames);
+      const double readCBase =
+        (c < 2) ? readBase[c] : ReadFractional(mBuffer[c], mWriteIndex, mCurrentDelayFrames, maxFrames);
 
       // Compander expansion on read (1:2 expand to recover dynamics).
       const double rectified = std::abs(readCBase);
@@ -338,7 +341,8 @@ DSP_SAMPLE** Delay::_ProcessAnalog(DSP_SAMPLE** inputs, const size_t numChannels
       const double bbdRead = mFeedbackLpState[c];
 
       // Optical chorus on the wet line: a second tap with LFO-modulated offset.
-      const double chorusRead = ReadFractional(mBuffer[c], mWriteIndex, mCurrentDelayFrames + chorusOffsetFrames, maxFrames);
+      const double chorusRead =
+        ReadFractional(mBuffer[c], mWriteIndex, mCurrentDelayFrames + chorusOffsetFrames, maxFrames);
       double wet = bbdRead * 0.6 + chorusRead * 0.4;
 
       // Tone tilt on wet bus.
@@ -358,7 +362,7 @@ DSP_SAMPLE** Delay::_ProcessAnalog(DSP_SAMPLE** inputs, const size_t numChannels
       if (mPingPong && numChannels > 1 && c < 2)
       {
         feedbackSrcBase = readBase[1 - c];
-        writeInput = (c == 1) ? PingPongSeed(inputs, s) : 0.0;
+        writeInput = PingPongSeed(inputs, c, s);
       }
       else
       {
