@@ -43,30 +43,52 @@ inline double ReadFractional(const std::vector<double>& buf, size_t writeIndex, 
 
 constexpr double kPingPongCorrelationSeconds = 0.05;
 constexpr double kPingPongFloor = 1.0e-30;
+// R flips below kPingPongInvertBelow and returns above kPingPongRestoreAbove; the gap
+// keeps an uncorrelated pair from toggling.
+constexpr double kPingPongInvertBelow = -0.2;
+constexpr double kPingPongRestoreAbove = -0.05;
+constexpr double kPingPongWeightRampSeconds = 0.01;
 
 } // namespace
 
-// Ping-pong feeds one mono seed into the R line only, so no echo is ever the
-// opposite polarity of another. A plain L/R mid cancels when R is a polarity-inverted
-// copy of L (Dual Amp's default split), so R's weight follows the running L/R
-// correlation rho: +1 down to rho = -0.25, -1 from rho = -0.75. One-sided,
-// uncorrelated and identical channels all get exactly +1, so L == R seeds exactly L.
-double Delay::_PingPongSeed(double l, double r, double coeff)
+// Ping-pong feeds one mono seed 0.5 * (L + w * R) into the R line only, so no echo is
+// ever the opposite polarity of another. A plain L/R mid cancels when R is a
+// polarity-inverted copy of L (Dual Amp's default split), so w is +1 or -1 by the sign
+// of the running L/R correlation, with hysteresis, ramped linearly so a flip does not
+// click. Silence (a floored mean) holds the sign, so the next note's attack is not
+// cancelled. Identical channels keep w at exactly 1, so L == R seeds exactly L.
+double Delay::_PingPongSeed(double l, double r, double coeff, double weightStep)
 {
   mPingPongLR += coeff * (l * r - mPingPongLR);
   mPingPongLL += coeff * (l * l - mPingPongLL);
   mPingPongRR += coeff * (r * r - mPingPongRR);
-  if (std::abs(mPingPongLR) < kPingPongFloor)
-    mPingPongLR = 0.0;
   if (mPingPongLL < kPingPongFloor)
     mPingPongLL = 0.0;
   if (mPingPongRR < kPingPongFloor)
     mPingPongRR = 0.0;
+  // LR decays with LL and RR but is the smallest of them; flooring it on its own
+  // would read a fading pair as uncorrelated and flip R back before the next note.
+  if (mPingPongLL == 0.0 || mPingPongRR == 0.0)
+    mPingPongLR = 0.0;
 
-  const double norm = std::sqrt(mPingPongLL * mPingPongRR);
-  const double rho = norm > kPingPongFloor ? mPingPongLR / norm : 0.0;
-  const double rWeight = std::clamp(2.0 + 4.0 * rho, -1.0, 1.0);
-  return 0.5 * (l + rWeight * r);
+  if (mPingPongLL > 0.0 && mPingPongRR > 0.0)
+  {
+    const double rho = mPingPongLR / std::sqrt(mPingPongLL * mPingPongRR);
+    if (rho < kPingPongInvertBelow)
+      mPingPongSign = -1.0;
+    else if (rho > kPingPongRestoreAbove)
+      mPingPongSign = 1.0;
+    if (!mPingPongHasSign)
+    {
+      mPingPongWeight = mPingPongSign;
+      mPingPongHasSign = true;
+    }
+  }
+  if (mPingPongWeight < mPingPongSign)
+    mPingPongWeight = std::min(mPingPongSign, mPingPongWeight + weightStep);
+  else if (mPingPongWeight > mPingPongSign)
+    mPingPongWeight = std::max(mPingPongSign, mPingPongWeight - weightStep);
+  return 0.5 * (l + mPingPongWeight * r);
 }
 
 Delay::Delay() {}
@@ -135,6 +157,9 @@ void Delay::Reset()
   mPingPongLR = 0.0;
   mPingPongLL = 0.0;
   mPingPongRR = 0.0;
+  mPingPongSign = 1.0;
+  mPingPongWeight = 1.0;
+  mPingPongHasSign = false;
   _ResetReverseState();
 }
 
@@ -250,11 +275,13 @@ DSP_SAMPLE** Delay::_ProcessDigital(DSP_SAMPLE** inputs, const size_t numChannel
 
   const bool pingPong = mPingPong && numChannels > 1;
   const double pingPongCoeff = 1.0 - std::exp(-1.0 / (kPingPongCorrelationSeconds * mSampleRate));
+  const double pingPongWeightStep = 2.0 / (kPingPongWeightRampSeconds * mSampleRate);
 
   for (size_t s = 0; s < numFrames; s++)
   {
     mCurrentDelayFrames += 0.001 * (mTargetDelayFrames - mCurrentDelayFrames);
-    const double pingPongSeed = pingPong ? _PingPongSeed(inputs[0][s], inputs[1][s], pingPongCoeff) : 0.0;
+    const double pingPongSeed =
+      pingPong ? _PingPongSeed(inputs[0][s], inputs[1][s], pingPongCoeff, pingPongWeightStep) : 0.0;
 
     // Read both channels first so ping-pong cross-feed is symmetric.
     double readSample[2] = {0.0, 0.0};
@@ -328,11 +355,13 @@ DSP_SAMPLE** Delay::_ProcessAnalog(DSP_SAMPLE** inputs, const size_t numChannels
   const double compRelease = std::exp(-1.0 / (0.150 * mSampleRate));
   const bool pingPong = mPingPong && numChannels > 1;
   const double pingPongCoeff = 1.0 - std::exp(-1.0 / (kPingPongCorrelationSeconds * mSampleRate));
+  const double pingPongWeightStep = 2.0 / (kPingPongWeightRampSeconds * mSampleRate);
 
   for (size_t s = 0; s < numFrames; s++)
   {
     mCurrentDelayFrames += 0.001 * (mTargetDelayFrames - mCurrentDelayFrames);
-    const double pingPongSeed = pingPong ? _PingPongSeed(inputs[0][s], inputs[1][s], pingPongCoeff) : 0.0;
+    const double pingPongSeed =
+      pingPong ? _PingPongSeed(inputs[0][s], inputs[1][s], pingPongCoeff, pingPongWeightStep) : 0.0;
 
     // LFO tick.
     mChorusPhase += chorusRateHz / mSampleRate;

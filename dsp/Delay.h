@@ -39,8 +39,8 @@ public:
   // - tone (0..1): per-mode tilt EQ; 0.5 = flat.
   // - age (0..1): per-mode character control (Digital crusher/noise, Analog BBD darkness/chorus depth,
   //   Reverse fade-shape softness).
-  // - pingPong: stereo cross-feedback toggle (one seed into the R line: L plus R signed by
-  //   the running L/R correlation; opposite tap feedback). Ignored by Reverse.
+  // - pingPong: stereo cross-feedback toggle (one seed into the R line: L plus R, R flipped
+  //   while the running L/R correlation is negative; opposite tap feedback). Ignored by Reverse.
   void SetParams(double timeMs, double feedback, double mix, int mode, double sampleRate, double tone, double age,
                  bool pingPong);
 
@@ -69,8 +69,8 @@ private:
 
   size_t _GetMaxFrames() const;
 
-  // Ping-pong seed for one frame; updates the running L/R statistics.
-  double _PingPongSeed(double l, double r, double coeff);
+  // Ping-pong seed for one frame; updates the running L/R statistics and R's weight.
+  double _PingPongSeed(double l, double r, double coeff, double weightStep);
 
   double mSampleRate = 0.0;
   double mTimeMs = 380.0;
@@ -123,6 +123,11 @@ private:
   double mPingPongLR = 0.0;
   double mPingPongLL = 0.0;
   double mPingPongRR = 0.0;
+  // R's weight in the seed (ramps to mPingPongSign); set directly at the first
+  // correlation reading after Reset().
+  double mPingPongSign = 1.0;
+  double mPingPongWeight = 1.0;
+  bool mPingPongHasSign = false;
 };
 
 } // namespace effect
