@@ -391,7 +391,7 @@ dsp::wav::LoadReturnCode dsp::wav::Load(const char* fileName, std::vector<float>
     if (!wfd.riffChunk.valid && strncmp(chunkId, "RIFF", 4) != 0)
     {
       {
-        std::cerr << "Error: File does not start with expected RIFF chunk. Got" << chunkId << " instead." << std::endl;
+        std::cerr << "Error: File does not start with expected RIFF chunk. Got" << std::string(chunkId, 4) << " instead." << std::endl;
         wavFile.close();
         return dsp::wav::LoadReturnCode::ERROR_NOT_RIFF;
       }
