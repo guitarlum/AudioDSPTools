@@ -29,6 +29,10 @@ public:
   // TODO states for the IR class
   dsp::wav::LoadReturnCode GetWavState() const { return this->mWavState; };
 
+protected:
+  // VoLum: also sizes the input history, so ReserveOutputs() leaves Process() nothing to allocate.
+  void _PrepareBuffers(const size_t numChannels, const size_t numFrames) override;
+
 private:
   // Set the weights, given that the plugin is running at the provided sample
   // rate.

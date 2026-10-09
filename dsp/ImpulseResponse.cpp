@@ -35,6 +35,12 @@ dsp::ImpulseResponse::ImpulseResponse(const IRData& irData, const double sampleR
   this->_SetWeights();
 }
 
+void dsp::ImpulseResponse::_PrepareBuffers(const size_t numChannels, const size_t numFrames)
+{
+  this->History::_PrepareBuffers(numChannels, numFrames);
+  this->_EnsureHistorySize(numFrames);
+}
+
 double** dsp::ImpulseResponse::Process(double** inputs, const size_t numChannels, const size_t numFrames)
 {
   this->_PrepareBuffers(numChannels, numFrames);

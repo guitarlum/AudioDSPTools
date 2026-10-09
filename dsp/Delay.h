@@ -68,6 +68,7 @@ private:
   double _ApplyToneTilt(size_t channel, double sample, double tone, double cutoffHz);
 
   size_t _GetMaxFrames() const;
+  size_t _GetMaxReverseFrames() const;
 
   // Ping-pong seed for one frame; updates the running L/R statistics and R's weight.
   double _PingPongSeed(double l, double r, double coeff, double weightStep);

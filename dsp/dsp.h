@@ -33,6 +33,12 @@ public:
   // This object instance will own the data referenced by the pointers and be
   // responsible for its allocation and deallocation.
   virtual DSP_SAMPLE** Process(DSP_SAMPLE** inputs, const size_t numChannels, const size_t numFrames) = 0;
+  // VoLum: size the output buffers for the largest block up front (call off the audio thread), so
+  // Process() calls of numFrames or fewer never allocate.
+  void ReserveOutputs(const size_t numChannels, const size_t numFrames)
+  {
+    this->_PrepareBuffers(numChannels, numFrames);
+  }
   // Update the parameters of the DSP object according to the provided params.
   // Not declaring a pure virtual bc there's no concrete definition that can
   // use Params.
@@ -100,9 +106,11 @@ protected:
   // Shall always be in the range [mHistoryRequired, mHistory.size()).
   size_t mHistoryIndex;
 
-private:
   // Make sure that the history array is long enough.
+  // VoLum: protected so ImpulseResponse can size it ahead of the audio thread.
   void _EnsureHistorySize(const size_t bufferSize);
+
+private:
   // Copy the end of the history back to the fron and reset mHistoryIndex
   void _RewindHistory();
 };

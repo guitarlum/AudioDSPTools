@@ -41,6 +41,13 @@ inline double ReadFractional(const std::vector<double>& buf, size_t writeIndex, 
   return buf[idx1] * (1.0 - frac) + buf[idx2] * frac;
 }
 
+// Longest user delay time (the kDelayTime param ceiling) and the furthest the Analog
+// chorus tap reaches past it: a 4 ms centre plus half of the 10 ms peak depth.
+constexpr double kMaxTimeMs = 2000.0;
+constexpr double kMaxChorusOffsetMs = 4.0 + 0.5 * 10.0;
+// Interpolation reads one frame past the integer index; keep that clear of the write head.
+constexpr size_t kRingMarginFrames = 8;
+
 constexpr double kPingPongCorrelationSeconds = 0.05;
 constexpr double kPingPongFloor = 1.0e-30;
 // R flips below kPingPongInvertBelow and returns above kPingPongRestoreAbove; the gap
@@ -97,6 +104,8 @@ void Delay::Prepare(const size_t numChannels, const size_t numFrames, double sam
 {
   mSampleRate = sampleRate;
   _PrepareBuffers(numChannels, numFrames);
+  // Reverse capture ring too, so entering Reverse mode never allocates on the audio thread.
+  _PrepareReverseBuffers(numChannels);
 }
 
 void Delay::SetParams(double timeMs, double feedback, double mix, int mode, double sampleRate)
@@ -121,7 +130,7 @@ void Delay::SetParams(double timeMs, double feedback, double mix, int mode, doub
     _ResetReverseState();
   }
 
-  mTimeMs = std::clamp(timeMs, 10.0, 2000.0);
+  mTimeMs = std::clamp(timeMs, 10.0, kMaxTimeMs);
   mFeedback = std::clamp(feedback, 0.0, 0.99);
   mMix = std::clamp(mix, 0.0, 1.0);
   mMode = std::clamp(mode, 0, kNumModes - 1);
@@ -139,7 +148,7 @@ void Delay::SetParams(double timeMs, double feedback, double mix, int mode, doub
   // into the in-flight voice's snapshot. Must be set BEFORE Reset() below so the
   // post-reset launch countdown reflects the new slice length.
   mReverseSegmentFrames = std::clamp<size_t>(
-    static_cast<size_t>(std::round(mTargetDelayFrames)), 2, std::max<size_t>(2, _GetMaxFrames() / 2));
+    static_cast<size_t>(std::round(mTargetDelayFrames)), 2, std::max<size_t>(2, _GetMaxReverseFrames() / 2));
 
   if (prevMode != mMode || prevPingPong != mPingPong)
     Reset();
@@ -189,7 +198,7 @@ void Delay::_PrepareDelayLines(const size_t numChannels)
 
 void Delay::_PrepareReverseBuffers(const size_t numChannels)
 {
-  const size_t ringSize = _GetMaxFrames();
+  const size_t ringSize = _GetMaxReverseFrames();
   bool resized = false;
 
   if (mReverseRing.size() != numChannels)
@@ -544,9 +553,18 @@ double Delay::_GetReverseWindowGain(size_t index, size_t length) const
   return (1.0 - mAge) * tri + mAge * sinSq;
 }
 
+// Forward ring: the longest time plus the Analog chorus tap's furthest reach, so the
+// modulated read at the 2000 ms ceiling never wraps onto the write head.
 size_t Delay::_GetMaxFrames() const
 {
-  return std::max<size_t>(1, static_cast<size_t>(2.0 * mSampleRate));
+  return std::max<size_t>(
+    1, static_cast<size_t>(std::ceil((kMaxTimeMs + kMaxChorusOffsetMs) * 0.001 * mSampleRate)) + kRingMarginFrames);
+}
+
+// Reverse ring: two voices of the longest slice must coexist without wrapping.
+size_t Delay::_GetMaxReverseFrames() const
+{
+  return std::max<size_t>(2, 2 * static_cast<size_t>(std::ceil(kMaxTimeMs * 0.001 * mSampleRate)));
 }
 
 } // namespace effect
