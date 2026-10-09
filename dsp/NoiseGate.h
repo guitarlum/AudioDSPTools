@@ -37,6 +37,15 @@ class Gain : public DSP
 public:
   DSP_SAMPLE** Process(DSP_SAMPLE** inputs, const size_t numChannels, const size_t numFrames) override;
 
+  // VoLum: size the gain-reduction copy for the largest block up front (off the audio thread), so the
+  // per-block SetGainReductionDB() below assigns within capacity instead of allocating.
+  void ReserveGainReduction(const size_t numChannels, const size_t numFrames)
+  {
+    this->mGainReductionDB.resize(numChannels);
+    for (auto& channel : this->mGainReductionDB)
+      channel.reserve(numFrames);
+  }
+
   void SetGainReductionDB(std::vector<std::vector<DSP_SAMPLE>>& gainReductionDB)
   {
     this->mGainReductionDB = gainReductionDB;
