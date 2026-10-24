@@ -30,6 +30,21 @@ inline long NextRingIndex(const long index)
 {
   return index + 1 == Degree ? 0 : index + 1;
 }
+
+// One step backward on a ring of `Degree` slots. The obvious `if (index < 0)`
+// becomes a conditional jump inside _ProcessFixedDegree, taken every Degree
+// samples. GCC mispredicts it and the fixed kernel loses the lead it has on
+// MSVC (Linux ratio ~0.50, Windows ~0.39) even though the any-degree loop is
+// already scalar. The arithmetic form is the same index sequence.
+template <long Degree>
+inline long StepBack(long index)
+{
+  const long prev = index - 1;
+  if constexpr (Degree <= 0)
+    return prev < 0 ? static_cast<long>(Degree) - 1 : prev;
+  else
+    return prev + ((prev >> (static_cast<long>(sizeof(long) * 8 - 1))) & static_cast<long>(Degree));
+}
 } // namespace
 
 // VoLum: each term stays its own `out +=` statement in the any-degree loop's order (input terms current ->
@@ -86,9 +101,7 @@ void recursive_linear_filter::Base::_ProcessFixedDegree(DSP_SAMPLE** inputs, con
     for (size_t s = 0; s < numFrames; s++)
     {
       DSP_SAMPLE out = 0.0;
-      inputStart -= 1;
-      if (inputStart < 0)
-        inputStart = InputDegree - 1;
+      inputStart = StepBack<InputDegree>(inputStart);
       const DSP_SAMPLE input0 = input[s];
       inputHistory[inputStart] = input0;
       out += inputCoefficient0 * input0;
@@ -97,9 +110,7 @@ void recursive_linear_filter::Base::_ProcessFixedDegree(DSP_SAMPLE** inputs, con
       if (InputDegree > 2)
         out += inputCoefficient2 * input2;
 
-      outputStart -= 1;
-      if (outputStart < 0)
-        outputStart = OutputDegree - 1;
+      outputStart = StepBack<OutputDegree>(outputStart);
       if (OutputDegree > 1)
         out += outputCoefficient1 * output1;
       if (OutputDegree > 2)
